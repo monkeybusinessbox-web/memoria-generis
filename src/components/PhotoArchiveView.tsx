@@ -33,13 +33,15 @@ import {
   parseGenealogyDate,
 } from '../utils/dateUtils';
 import { compressImageFile } from '../utils/storage';
-import { CroppedCircleAvatar } from './PhotoCropModal';
+import { computeTagFrameFromCrop, CroppedCircleAvatar } from './PhotoCropModal';
 import { PhotoTagFrameLayer, TagFrameRect } from './PhotoTagFrameLayer';
 
 interface PhotoArchiveViewProps {
   tree: TreeDocument;
   onUpdatePerson: (personId: string, patch: Partial<Person>) => void;
   onUpdateArchivePhotos: (updater: (curr: PhotoAttachment[]) => PhotoAttachment[]) => void;
+  onUpdateSharedPhoto?: (dataUrl: string, patch: Partial<PhotoAttachment>) => void;
+  onDeleteSharedPhoto?: (dataUrl: string) => void;
   onOpenPersonInTree: (personId: string) => void;
 }
 
@@ -72,6 +74,7 @@ interface UnifiedArchiveItem {
   source: 'archive' | 'person';
   ownerId?: string;
   owner?: Person;
+  owners: Person[];
   photo: PhotoAttachment;
   effectiveCategory: ArchiveCategory;
   sortKey: number;
@@ -110,6 +113,8 @@ export function PhotoArchiveView({
   tree,
   onUpdatePerson,
   onUpdateArchivePhotos,
+  onUpdateSharedPhoto,
+  onDeleteSharedPhoto,
   onOpenPersonInTree,
 }: PhotoArchiveViewProps) {
   const [searchQuery, setSearchQuery] = useState('');
@@ -126,6 +131,7 @@ export function PhotoArchiveView({
     source: 'archive' | 'person';
     ownerId?: string;
     photoId: string;
+    dataUrl?: string;
   } | null>(null);
   const [isTagging, setIsTagging] = useState(false);
   const [fullscreenView, setFullscreenView] = useState(false);
@@ -143,38 +149,131 @@ export function PhotoArchiveView({
     [tree.persons]
   );
 
-  // Aggregate both general archive items (documents, letters, certificates, group photos)
-  // and person-attached photos into a single searchable catalog.
+  // Aggregate both general archive items and person-attached photos into a single
+  // deduplicated catalog (one entry per unique image, merging tags & card references).
   const allItems = useMemo<UnifiedArchiveItem[]>(() => {
-    const items: UnifiedArchiveItem[] = [];
+    interface GroupedRecord {
+      key: string;
+      source: 'archive' | 'person';
+      ownerId?: string;
+      owner?: Person;
+      owners: Person[];
+      ownerIds: Set<string>;
+      primaryPhoto: PhotoAttachment;
+      tagsByPerson: Map<string, NonNullable<PhotoAttachment['tags']>[number]>;
+      ownerCrops: Array<{ personId: string; photo: PhotoAttachment }>;
+      customTagsSet: Set<string>;
+    }
+
+    const byUrl = new Map<string, GroupedRecord>();
+    const unkeyed: GroupedRecord[] = [];
+
+    const mergeRecord = (
+      source: 'archive' | 'person',
+      ph: PhotoAttachment,
+      owner?: Person
+    ) => {
+      const urlKey = ph.dataUrl?.trim();
+      let rec = urlKey ? byUrl.get(urlKey) : undefined;
+      if (!rec) {
+        rec = {
+          key: source === 'archive' ? `archive:${ph.id}` : `person:${owner?.id}:${ph.id}`,
+          source,
+          ownerId: owner?.id,
+          owner,
+          owners: owner ? [owner] : [],
+          ownerIds: new Set(owner ? [owner.id] : []),
+          primaryPhoto: { ...ph },
+          tagsByPerson: new Map(),
+          ownerCrops: [],
+          customTagsSet: new Set(ph.customTags || []),
+        };
+        if (urlKey) byUrl.set(urlKey, rec);
+        else unkeyed.push(rec);
+      } else {
+        if (owner && !rec.ownerIds.has(owner.id)) {
+          rec.ownerIds.add(owner.id);
+          rec.owners.push(owner);
+        }
+        if (!rec.primaryPhoto.caption && ph.caption) rec.primaryPhoto.caption = ph.caption;
+        if (!rec.primaryPhoto.year && ph.year) rec.primaryPhoto.year = ph.year;
+        if (!rec.primaryPhoto.date && ph.date) rec.primaryPhoto.date = ph.date;
+        if (!rec.primaryPhoto.place && ph.place) rec.primaryPhoto.place = ph.place;
+        if (!rec.primaryPhoto.category && ph.category) rec.primaryPhoto.category = ph.category;
+        if (!rec.primaryPhoto.archiveRef && ph.archiveRef) {
+          rec.primaryPhoto.archiveRef = ph.archiveRef;
+        }
+        if (!rec.primaryPhoto.notes && ph.notes) rec.primaryPhoto.notes = ph.notes;
+        for (const ct of ph.customTags || []) rec.customTagsSet.add(ct);
+      }
+
+      for (const t of ph.tags || []) {
+        const prev = rec.tagsByPerson.get(t.personId);
+        const hasDims = typeof t.w === 'number' && typeof t.h === 'number';
+        const prevHasDims = Boolean(
+          prev && typeof prev.w === 'number' && typeof prev.h === 'number'
+        );
+        if (!prev || (hasDims && !prevHasDims)) {
+          rec.tagsByPerson.set(t.personId, { ...t });
+        }
+      }
+
+      if (owner) {
+        rec.ownerCrops.push({ personId: owner.id, photo: ph });
+      }
+    };
 
     for (const ph of tree.archivePhotos || []) {
-      items.push({
-        key: `archive:${ph.id}`,
-        source: 'archive',
-        photo: ph,
-        effectiveCategory: resolveDefaultCategory(ph, 'archive'),
-        sortKey: resolveItemSortKey(ph),
-        dateLabel: resolveItemDateLabel(ph),
-      });
+      mergeRecord('archive', ph);
     }
 
     for (const p of allPeopleSorted) {
       for (const ph of p.photos) {
-        items.push({
-          key: `person:${p.id}:${ph.id}`,
-          source: 'person',
-          ownerId: p.id,
-          owner: p,
-          photo: ph,
-          effectiveCategory: resolveDefaultCategory(ph, 'person'),
-          sortKey: resolveItemSortKey(ph),
-          dateLabel: resolveItemDateLabel(ph),
-        });
+        mergeRecord('person', ph, p);
       }
     }
 
-    return items;
+    const records = [...byUrl.values(), ...unkeyed];
+    return records.map((rec) => {
+      // Ensure every person card that cropped/selected this shared photo is marked on it
+      for (const { personId, photo } of rec.ownerCrops) {
+        if (!rec.tagsByPerson.has(personId) && photo.crop) {
+          const frame = computeTagFrameFromCrop(photo.crop, 1);
+          rec.tagsByPerson.set(personId, {
+            id: `auto_${personId}_${photo.id}`,
+            personId,
+            x: frame.x,
+            y: frame.y,
+            w: frame.w,
+            h: frame.h,
+          });
+        }
+      }
+
+      const mergedPhoto: PhotoAttachment = {
+        ...rec.primaryPhoto,
+        tags: Array.from(rec.tagsByPerson.values()),
+        customTags: Array.from(rec.customTagsSet),
+      };
+
+      const defaultCategory =
+        mergedPhoto.category ||
+        ((mergedPhoto.tags || []).length > 1 || rec.owners.length > 1
+          ? 'group'
+          : resolveDefaultCategory(mergedPhoto, rec.source));
+
+      return {
+        key: rec.key,
+        source: rec.source,
+        ownerId: rec.ownerId,
+        owner: rec.owner,
+        owners: rec.owners,
+        photo: mergedPhoto,
+        effectiveCategory: defaultCategory,
+        sortKey: resolveItemSortKey(mergedPhoto),
+        dateLabel: resolveItemDateLabel(mergedPhoto),
+      };
+    });
   }, [allPeopleSorted, tree.archivePhotos]);
 
   const categoryCounts = useMemo(() => {
@@ -239,7 +338,7 @@ export function PhotoArchiveView({
         if (!hasTag) return false;
       }
       if (personFilter !== 'all') {
-        const isOwner = item.ownerId === personFilter;
+        const isOwner = item.owners.some((o) => o.id === personFilter);
         const isTagged = (item.photo.tags || []).some(
           (t) => t.personId === personFilter
         );
@@ -252,9 +351,9 @@ export function PhotoArchiveView({
         .filter((p): p is Person => Boolean(p))
         .map((p) => `${p.lastName} ${p.firstName} ${p.middleName || ''} ${p.maidenName || ''}`)
         .join(' ');
-      const ownerName = item.owner
-        ? `${item.owner.lastName} ${item.owner.firstName} ${item.owner.middleName || ''}`
-        : '';
+      const ownerName = item.owners
+        .map((o) => `${o.lastName} ${o.firstName} ${o.middleName || ''}`)
+        .join(' ');
       const haystack = [
         item.photo.caption || '',
         item.photo.date || '',
@@ -319,6 +418,10 @@ export function PhotoArchiveView({
 
   const activeItem = useMemo<UnifiedArchiveItem | null>(() => {
     if (!selectedRef) return null;
+    if (selectedRef.dataUrl) {
+      const byUrl = allItems.find((item) => item.photo.dataUrl === selectedRef.dataUrl);
+      if (byUrl) return byUrl;
+    }
     return (
       allItems.find((item) => {
         if (item.source !== selectedRef.source) return false;
@@ -332,6 +435,10 @@ export function PhotoArchiveView({
     item: UnifiedArchiveItem,
     patch: Partial<PhotoAttachment>
   ) => {
+    if (onUpdateSharedPhoto && item.photo.dataUrl) {
+      onUpdateSharedPhoto(item.photo.dataUrl, patch);
+      return;
+    }
     if (item.source === 'archive') {
       onUpdateArchivePhotos((curr) =>
         curr.map((ph) => (ph.id === item.photo.id ? { ...ph, ...patch } : ph))
@@ -350,7 +457,9 @@ export function PhotoArchiveView({
   };
 
   const handleDeleteItem = (item: UnifiedArchiveItem) => {
-    if (item.source === 'archive') {
+    if (onDeleteSharedPhoto && item.photo.dataUrl) {
+      onDeleteSharedPhoto(item.photo.dataUrl);
+    } else if (item.source === 'archive') {
       onUpdateArchivePhotos((curr) => curr.filter((ph) => ph.id !== item.photo.id));
     } else if (item.ownerId) {
       const owner = tree.persons[item.ownerId];
@@ -373,10 +482,23 @@ export function PhotoArchiveView({
     if (!files || files.length === 0) return;
     setIsUploading(true);
     try {
+      const existingByUrl = new Map<string, UnifiedArchiveItem>();
+      for (const item of allItems) {
+        if (item.photo.dataUrl) existingByUrl.set(item.photo.dataUrl, item);
+      }
+
       const added: PhotoAttachment[] = [];
+      let firstExisting: UnifiedArchiveItem | null = null;
+
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const dataUrl = await compressImageFile(file, 1200, 0.86);
+        const duplicate = existingByUrl.get(dataUrl);
+        if (duplicate) {
+          if (!firstExisting) firstExisting = duplicate;
+          continue;
+        }
+        if (added.some((a) => a.dataUrl === dataUrl)) continue;
         added.push({
           id: createId('arch'),
           dataUrl,
@@ -387,9 +509,25 @@ export function PhotoArchiveView({
           crop: { x: 0, y: 0, zoom: 1 },
         });
       }
-      onUpdateArchivePhotos((curr) => [...added, ...curr]);
+      if (added.length > 0) {
+        onUpdateArchivePhotos((curr) => [...added, ...curr]);
+      }
       if (added[0]) {
-        setSelectedRef({ source: 'archive', photoId: added[0].id });
+        setSelectedRef({
+          source: 'archive',
+          photoId: added[0].id,
+          dataUrl: added[0].dataUrl,
+        });
+        setIsTagging(false);
+        setPendingFrame(null);
+        setConfirmDelete(false);
+      } else if (firstExisting) {
+        setSelectedRef({
+          source: firstExisting.source,
+          ownerId: firstExisting.ownerId,
+          photoId: firstExisting.photo.id,
+          dataUrl: firstExisting.photo.dataUrl,
+        });
         setIsTagging(false);
         setPendingFrame(null);
         setConfirmDelete(false);
@@ -721,6 +859,7 @@ export function PhotoArchiveView({
                         source: item.source,
                         ownerId: item.ownerId,
                         photoId: item.photo.id,
+                        dataUrl: item.photo.dataUrl,
                       });
                       setIsTagging(false);
                       setFullscreenView(false);
@@ -783,11 +922,11 @@ export function PhotoArchiveView({
                       </div>
 
                       <div className="space-y-1.5 pt-2 border-t border-stone-100">
-                        {item.owner && (
+                        {item.owners.length > 0 && (
                           <div className="text-[14.5px] text-stone-500">
                             Досье:{' '}
                             <span className="font-medium text-stone-700">
-                              {formatFullName(item.owner)}
+                              {item.owners.map((o) => formatFullName(o)).join(', ')}
                             </span>
                           </div>
                         )}
@@ -834,6 +973,7 @@ export function PhotoArchiveView({
                         source: item.source,
                         ownerId: item.ownerId,
                         photoId: item.photo.id,
+                        dataUrl: item.photo.dataUrl,
                       });
                       setIsTagging(false);
                       setFullscreenView(false);
@@ -886,9 +1026,12 @@ export function PhotoArchiveView({
                       </div>
 
                       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-[14.5px] text-stone-500">
-                        {item.owner && (
+                        {item.owners.length > 0 && (
                           <span>
-                            Досье: <strong className="font-medium text-stone-700">{formatFullName(item.owner)}</strong>
+                            Досье:{' '}
+                            <strong className="font-medium text-stone-700">
+                              {item.owners.map((o) => formatFullName(o)).join(', ')}
+                            </strong>
                           </span>
                         )}
                         {taggedPeople.length > 0 && (
@@ -1277,21 +1420,26 @@ export function PhotoArchiveView({
                 <div className="space-y-3 border-t border-stone-200 pt-3">
                   <div>
                     <div className="text-[13px] text-stone-500">
-                      {activeItem.owner
-                        ? `Досье: ${formatFullName(activeItem.owner)}`
+                      {activeItem.owners.length > 0
+                        ? 'Используется в карточках:'
                         : 'Общий семейный фотоархив'}
                     </div>
-                    {activeItem.owner && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSelectedRef(null);
-                          onOpenPersonInTree(activeItem.owner!.id);
-                        }}
-                        className="mt-0.5 text-[13px] font-medium text-[#8B261D] hover:underline cursor-pointer"
-                      >
-                        Открыть досье на древе →
-                      </button>
+                    {activeItem.owners.length > 0 && (
+                      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1">
+                        {activeItem.owners.map((ownerPerson) => (
+                          <button
+                            key={ownerPerson.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedRef(null);
+                              onOpenPersonInTree(ownerPerson.id);
+                            }}
+                            className="text-[13px] font-medium text-[#8B261D] hover:underline cursor-pointer"
+                          >
+                            {formatShortName(ownerPerson)} →
+                          </button>
+                        ))}
+                      </div>
                     )}
                   </div>
 

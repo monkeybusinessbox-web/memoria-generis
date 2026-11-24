@@ -92,25 +92,30 @@ export async function exportTreeToZipFile(tree: TreeDocument): Promise<void> {
   const zip = new JSZip();
   const photosFolder = zip.folder('photos');
 
-  // Replace heavy inline base64 dataUrls in archive.json with clean relative photo paths
+  // Replace heavy inline base64 dataUrls in archive.json with clean relative photo paths (deduplicated)
   const zipReadyTree: TreeDocument = JSON.parse(JSON.stringify(resolved));
+  const writtenByDataUrl = new Map<string, string>();
+  const writeOrReusePhoto = (rawUrl: string, candidateName: string): string | null => {
+    const existingPath = writtenByDataUrl.get(rawUrl);
+    if (existingPath) return existingPath;
+    const bin = dataUrlToBinary(rawUrl);
+    if (!bin || !photosFolder) return null;
+    const filename = `${candidateName}.${bin.ext}`;
+    photosFolder.file(filename, bin.bytes);
+    const relPath = `photos/${filename}`;
+    writtenByDataUrl.set(rawUrl, relPath);
+    return relPath;
+  };
+
   for (const person of Object.values(zipReadyTree.persons)) {
     for (const photo of person.photos) {
-      const bin = dataUrlToBinary(photo.dataUrl);
-      if (bin && photosFolder) {
-        const filename = `${person.id}_${photo.id}.${bin.ext}`;
-        photosFolder.file(filename, bin.bytes);
-        photo.dataUrl = `photos/${filename}`;
-      }
+      const relPath = writeOrReusePhoto(photo.dataUrl, `${person.id}_${photo.id}`);
+      if (relPath) photo.dataUrl = relPath;
     }
   }
   for (const photo of zipReadyTree.archivePhotos || []) {
-    const bin = dataUrlToBinary(photo.dataUrl);
-    if (bin && photosFolder) {
-      const filename = `archive_${photo.id}.${bin.ext}`;
-      photosFolder.file(filename, bin.bytes);
-      photo.dataUrl = `photos/${filename}`;
-    }
+    const relPath = writeOrReusePhoto(photo.dataUrl, `archive_${photo.id}`);
+    if (relPath) photo.dataUrl = relPath;
   }
 
   zip.file('archive.json', JSON.stringify(zipReadyTree, null, 2));
@@ -118,6 +123,121 @@ export async function exportTreeToZipFile(tree: TreeDocument): Promise<void> {
 
   const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
   triggerDownload(blob, `${sanitizeFileBase(tree.title)}_archive_${formatExportTimestamp()}.zip`);
+}
+
+const externalAssetSizeCache = new Map<string, number>();
+
+export async function collectExternalAssetSizes(
+  tree: TreeDocument
+): Promise<Record<string, number>> {
+  const urls = new Set<string>();
+  for (const person of Object.values(tree.persons)) {
+    for (const ph of person.photos) {
+      if (ph.dataUrl && !ph.dataUrl.startsWith('data:')) {
+        urls.add(ph.dataUrl);
+      }
+    }
+  }
+  for (const ph of tree.archivePhotos || []) {
+    if (ph.dataUrl && !ph.dataUrl.startsWith('data:')) {
+      urls.add(ph.dataUrl);
+    }
+  }
+
+  const out: Record<string, number> = {};
+  await Promise.all(
+    Array.from(urls).map(async (url) => {
+      const cached = externalAssetSizeCache.get(url);
+      if (cached !== undefined) {
+        out[url] = cached;
+        return;
+      }
+      try {
+        const res = await fetch(url);
+        const blob = await res.blob();
+        externalAssetSizeCache.set(url, blob.size);
+        out[url] = blob.size;
+      } catch {
+        // Ignore unfetchable asset
+      }
+    })
+  );
+  return out;
+}
+
+function estimateBase64BinarySize(dataUrl: string): number {
+  if (!dataUrl || !dataUrl.startsWith('data:')) return 0;
+  const commaIdx = dataUrl.indexOf(',');
+  if (commaIdx < 0) return 0;
+  const b64 = dataUrl.slice(commaIdx + 1);
+  let padding = 0;
+  if (b64.endsWith('==')) padding = 2;
+  else if (b64.endsWith('=')) padding = 1;
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
+}
+
+export function estimateProjectZipBytes(
+  tree: TreeDocument,
+  externalSizes: Record<string, number> = {}
+): { zipBytes: number; rawBytes: number } {
+  let mediaBinaryBytes = 0;
+  let mediaCount = 0;
+  let docBase64Bytes = 0;
+  let rawMediaBase64Bytes = 0;
+
+  const accountPhoto = (dataUrl: string) => {
+    if (!dataUrl) return;
+    if (dataUrl.startsWith('data:')) {
+      const bin = estimateBase64BinarySize(dataUrl);
+      mediaBinaryBytes += bin;
+      rawMediaBase64Bytes += dataUrl.length;
+      mediaCount += 1;
+    } else {
+      const extSize = externalSizes[dataUrl] ?? externalAssetSizeCache.get(dataUrl) ?? 0;
+      mediaBinaryBytes += extSize;
+      rawMediaBase64Bytes += Math.round((extSize * 4) / 3);
+      if (extSize > 0) mediaCount += 1;
+    }
+  };
+
+  const accountDocs = (docs?: Array<{ dataUrl?: string }>) => {
+    if (!docs) return;
+    for (const d of docs) {
+      if (d.dataUrl) {
+        docBase64Bytes += d.dataUrl.length;
+      }
+    }
+  };
+
+  for (const p of Object.values(tree.persons)) {
+    for (const ph of p.photos) accountPhoto(ph.dataUrl);
+    accountDocs(p.birthDocuments);
+    accountDocs(p.deathDocuments);
+    for (const ev of p.events) accountDocs(ev.documents);
+  }
+  for (const ph of tree.archivePhotos || []) accountPhoto(ph.dataUrl);
+  for (const u of tree.unions) accountDocs(u.documents);
+
+  const personCount = Object.keys(tree.persons).length;
+  const approxMetadataTextBytes =
+    800 +
+    personCount * 620 +
+    tree.unions.length * 220 +
+    tree.parentChildLinks.length * 140;
+
+  const rawBytes = approxMetadataTextBytes + rawMediaBase64Bytes + docBase64Bytes;
+
+  // JPEG/PNG/WebP photos are already compressed (~99% after DEFLATE),
+  // embedded base64 documents compress ~22%, JSON+GEDCOM text compresses ~72%.
+  const compressedMedia = Math.round(mediaBinaryBytes * 0.99);
+  const compressedDocs = Math.round(docBase64Bytes * 0.78);
+  const compressedText = Math.round(approxMetadataTextBytes * 0.28);
+  const zipOverhead = 240 + (mediaCount + 2) * 96;
+
+  return {
+    zipBytes: compressedMedia + compressedDocs + compressedText + zipOverhead,
+    rawBytes,
+  };
 }
 
 export function validateAndNormalizeTree(raw: unknown): TreeDocument {

@@ -9,7 +9,9 @@ import {
   ChevronDown,
   ChevronUp,
   Crop,
+  FolderOpen,
   Heart,
+  Image as ImageIcon,
   Link2,
   MapPin,
   Pencil,
@@ -73,6 +75,13 @@ interface PersonInspectorProps {
   onClose: () => void;
   onUpdatePerson: (personId: string, patch: Partial<Person>) => void;
   onUpdateArchivePhotos?: (updater: (curr: PhotoAttachment[]) => PhotoAttachment[]) => void;
+  onSaveCroppedPhoto?: (
+    personId: string,
+    originalDataUrl: string,
+    updatedPhoto: PhotoAttachment,
+    tagFrame?: TagFrameRect
+  ) => void;
+  onUpdateSharedPhoto?: (dataUrl: string, patch: Partial<PhotoAttachment>) => void;
   onDeletePerson: (personId: string) => void;
   onSelectPerson: (personId: string) => void;
   onAddRelative: (
@@ -107,6 +116,8 @@ export function PersonInspector({
   onClose,
   onUpdatePerson,
   onUpdateArchivePhotos,
+  onSaveCroppedPhoto,
+  onUpdateSharedPhoto,
   onDeletePerson,
   onSelectPerson,
   onAddRelative,
@@ -122,6 +133,9 @@ export function PersonInspector({
   const [lightboxRef, setLightboxRef] = useState<{ ownerId: string; photoId: string } | null>(null);
   const [croppingPhoto, setCroppingPhoto] = useState<PhotoAttachment | null>(null);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
+  const [showArchivePicker, setShowArchivePicker] = useState(false);
+  const [archivePickerQuery, setArchivePickerQuery] = useState('');
+  const [archivePickerScope, setArchivePickerScope] = useState<'all' | 'archive'>('all');
 
   // Photo person tagging & search
   const [photoPersonSearch, setPhotoPersonSearch] = useState('');
@@ -194,47 +208,38 @@ export function PersonInspector({
   const otherPeople = allPeopleSorted.filter((p) => p.id !== person.id);
 
   const taggedElsewherePhotos = useMemo(() => {
+    const seenUrls = new Set<string>(
+      person.photos.map((ph) => ph.dataUrl).filter(Boolean)
+    );
     const items: Array<{ owner: Person | null; ownerId: string; photo: PhotoAttachment }> = [];
+    for (const ph of tree.archivePhotos || []) {
+      if (!ph.dataUrl || seenUrls.has(ph.dataUrl)) continue;
+      if (ph.tags?.some((t) => t.personId === person.id)) {
+        seenUrls.add(ph.dataUrl);
+        items.push({ owner: null, ownerId: '__archive__', photo: ph });
+      }
+    }
     for (const owner of allPeopleSorted) {
       if (owner.id === person.id) continue;
       for (const ph of owner.photos) {
+        if (!ph.dataUrl || seenUrls.has(ph.dataUrl)) continue;
         if (ph.tags?.some((t) => t.personId === person.id)) {
+          seenUrls.add(ph.dataUrl);
           items.push({ owner, ownerId: owner.id, photo: ph });
         }
       }
     }
-    for (const ph of tree.archivePhotos || []) {
-      if (ph.tags?.some((t) => t.personId === person.id)) {
-        items.push({ owner: null, ownerId: '__archive__', photo: ph });
-      }
-    }
     return items;
-  }, [allPeopleSorted, person.id, tree.archivePhotos]);
+  }, [allPeopleSorted, person.id, person.photos, tree.archivePhotos]);
 
   const photoSearchResults = useMemo(() => {
     const q = photoPersonSearch.trim().toLowerCase();
     if (!q) return [];
+    const seenUrls = new Set<string>();
     const results: Array<{ owner: Person | null; ownerId: string; photo: PhotoAttachment }> = [];
-    for (const owner of allPeopleSorted) {
-      for (const ph of owner.photos) {
-        const taggedMatch = (ph.tags || []).some((t) => {
-          const tp = tree.persons[t.personId];
-          if (!tp) return false;
-          return `${tp.lastName} ${tp.firstName} ${tp.middleName || ''} ${tp.maidenName || ''}`
-            .toLowerCase()
-            .includes(q);
-        });
-        const ownerMatch = `${owner.lastName} ${owner.firstName} ${owner.middleName || ''} ${
-          owner.maidenName || ''
-        }`
-          .toLowerCase()
-          .includes(q);
-        if (taggedMatch || ownerMatch) {
-          results.push({ owner, ownerId: owner.id, photo: ph });
-        }
-      }
-    }
-    for (const ph of tree.archivePhotos || []) {
+
+    const checkAndPush = (owner: Person | null, ownerId: string, ph: PhotoAttachment) => {
+      if (!ph.dataUrl || seenUrls.has(ph.dataUrl)) return;
       const taggedMatch = (ph.tags || []).some((t) => {
         const tp = tree.persons[t.personId];
         if (!tp) return false;
@@ -242,12 +247,33 @@ export function PersonInspector({
           .toLowerCase()
           .includes(q);
       });
-      if (taggedMatch) {
-        results.push({ owner: null, ownerId: '__archive__', photo: ph });
+      const ownerMatch = owner
+        ? `${owner.lastName} ${owner.firstName} ${owner.middleName || ''} ${
+            owner.maidenName || ''
+          }`
+            .toLowerCase()
+            .includes(q)
+        : false;
+      if (taggedMatch || ownerMatch) {
+        seenUrls.add(ph.dataUrl);
+        results.push({ owner, ownerId, photo: ph });
+      }
+    };
+
+    for (const ph of person.photos) {
+      checkAndPush(person, person.id, ph);
+    }
+    for (const ph of tree.archivePhotos || []) {
+      checkAndPush(null, '__archive__', ph);
+    }
+    for (const owner of allPeopleSorted) {
+      if (owner.id === person.id) continue;
+      for (const ph of owner.photos) {
+        checkAndPush(owner, owner.id, ph);
       }
     }
     return results;
-  }, [allPeopleSorted, photoPersonSearch, tree.archivePhotos, tree.persons]);
+  }, [allPeopleSorted, person, photoPersonSearch, tree.archivePhotos, tree.persons]);
 
   const liveLightbox = useMemo(() => {
     if (!lightboxRef) return null;
@@ -275,23 +301,54 @@ export function PersonInspector({
     if (!files || files.length === 0) return;
     setIsUploadingPhoto(true);
     try {
+      const existingByUrl = new Map<string, PhotoAttachment>();
+      for (const ph of tree.archivePhotos || []) {
+        if (ph.dataUrl && !existingByUrl.has(ph.dataUrl)) existingByUrl.set(ph.dataUrl, ph);
+      }
+      for (const p of Object.values(tree.persons)) {
+        for (const ph of p.photos) {
+          if (ph.dataUrl && !existingByUrl.has(ph.dataUrl)) existingByUrl.set(ph.dataUrl, ph);
+        }
+      }
+
       const added: PhotoAttachment[] = [];
+      let nextPhotos = [...person.photos];
+      let firstAdded: PhotoAttachment | null = null;
+
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const dataUrl = await compressImageFile(file);
-        added.push({
+        const alreadyInPerson = nextPhotos.find((ph) => ph.dataUrl === dataUrl);
+        if (alreadyInPerson) {
+          if (!firstAdded) firstAdded = alreadyInPerson;
+          continue;
+        }
+        const sharedMatch = existingByUrl.get(dataUrl);
+        const newPhoto: PhotoAttachment = {
           id: createId('ph'),
           dataUrl,
-          caption: file.name.replace(/\.[^.]+$/, ''),
-          isPrimary: person.photos.length === 0 && i === 0,
+          caption: sharedMatch?.caption ?? file.name.replace(/\.[^.]+$/, ''),
+          year: sharedMatch?.year,
+          date: sharedMatch?.date,
+          place: sharedMatch?.place,
+          category: sharedMatch?.category,
+          customTags: sharedMatch?.customTags ? [...sharedMatch.customTags] : undefined,
+          archiveRef: sharedMatch?.archiveRef,
+          notes: sharedMatch?.notes,
+          isPrimary: nextPhotos.length === 0 && added.length === 0,
           crop: { x: 0, y: 0, zoom: 1 },
-          tags: [],
-        });
+          tags: sharedMatch?.tags ? sharedMatch.tags.map((t) => ({ ...t })) : [],
+        };
+        added.push(newPhoto);
+        nextPhotos.push(newPhoto);
+        if (!firstAdded) firstAdded = newPhoto;
       }
-      const nextPhotos = [...person.photos, ...added];
-      onUpdatePerson(person.id, { photos: nextPhotos });
-      if (added[0]) {
-        setCroppingPhoto(added[0]);
+
+      if (added.length > 0) {
+        onUpdatePerson(person.id, { photos: nextPhotos });
+      }
+      if (firstAdded) {
+        setCroppingPhoto(firstAdded);
       }
     } finally {
       setIsUploadingPhoto(false);
@@ -299,9 +356,32 @@ export function PersonInspector({
     }
   };
 
-  const handleSaveCroppedPhoto = (updated: PhotoAttachment) => {
+  const handleSaveCroppedPhoto = (updated: PhotoAttachment, tagFrame?: TagFrameRect) => {
+    if (onSaveCroppedPhoto) {
+      onSaveCroppedPhoto(
+        person.id,
+        croppingPhoto?.dataUrl || updated.dataUrl,
+        updated,
+        tagFrame
+      );
+      setCroppingPhoto(null);
+      return;
+    }
+
+    const nextTags = [...(updated.tags || []).filter((t) => t.personId !== person.id)];
+    if (tagFrame) {
+      nextTags.push({
+        id: createId('tag'),
+        personId: person.id,
+        x: tagFrame.x,
+        y: tagFrame.y,
+        w: tagFrame.w,
+        h: tagFrame.h,
+      });
+    }
+    const nextPhoto = { ...updated, tags: nextTags };
     onUpdatePerson(person.id, {
-      photos: person.photos.map((ph) => (ph.id === updated.id ? updated : ph)),
+      photos: person.photos.map((ph) => (ph.id === nextPhoto.id ? nextPhoto : ph)),
     });
     setCroppingPhoto(null);
   };
@@ -314,12 +394,104 @@ export function PersonInspector({
     onUpdatePerson(person.id, { photos: updated });
   };
 
+  const archivePickerItems = useMemo(() => {
+    const seenUrls = new Set<string>();
+    const list: Array<{
+      key: string;
+      sourceLabel: string;
+      isArchive: boolean;
+      photo: PhotoAttachment;
+      searchText: string;
+    }> = [];
+
+    for (const ph of tree.archivePhotos || []) {
+      if (!ph.dataUrl) continue;
+      seenUrls.add(ph.dataUrl);
+      const taggedNames = (ph.tags || [])
+        .map((t) => tree.persons[t.personId])
+        .filter((tp): tp is Person => Boolean(tp))
+        .map((tp) => formatFullName(tp))
+        .join(' ');
+      list.push({
+        key: `arch:${ph.id}`,
+        sourceLabel: 'Общий фотоархив',
+        isArchive: true,
+        photo: ph,
+        searchText: `${ph.caption || ''} ${ph.year || ''} ${ph.date || ''} ${ph.place || ''} ${taggedNames}`.toLowerCase(),
+      });
+    }
+
+    if (archivePickerScope === 'all') {
+      for (const p of allPeopleSorted) {
+        const ownerName = formatFullName(p);
+        for (const ph of p.photos) {
+          if (!ph.dataUrl || seenUrls.has(ph.dataUrl)) continue;
+          seenUrls.add(ph.dataUrl);
+          const taggedNames = (ph.tags || [])
+            .map((t) => tree.persons[t.personId])
+            .filter((tp): tp is Person => Boolean(tp))
+            .map((tp) => formatFullName(tp))
+            .join(' ');
+          list.push({
+            key: `per:${p.id}:${ph.id}`,
+            sourceLabel: ownerName,
+            isArchive: false,
+            photo: ph,
+            searchText: `${ownerName} ${ph.caption || ''} ${ph.year || ''} ${ph.date || ''} ${ph.place || ''} ${taggedNames}`.toLowerCase(),
+          });
+        }
+      }
+    }
+
+    const q = archivePickerQuery.trim().toLowerCase();
+    return q ? list.filter((item) => item.searchText.includes(q)) : list;
+  }, [allPeopleSorted, archivePickerQuery, archivePickerScope, tree.archivePhotos, tree.persons]);
+
+  const handlePickPhotoFromArchive = (sourcePhoto: PhotoAttachment) => {
+    const existing = person.photos.find((ph) => ph.dataUrl === sourcePhoto.dataUrl);
+    if (existing) {
+      const updated = person.photos.map((ph) => ({
+        ...ph,
+        isPrimary: ph.id === existing.id,
+      }));
+      onUpdatePerson(person.id, { photos: updated });
+      setShowArchivePicker(false);
+      setCroppingPhoto({ ...existing, isPrimary: true });
+      return;
+    }
+
+    const newPhoto: PhotoAttachment = {
+      id: createId('ph'),
+      dataUrl: sourcePhoto.dataUrl,
+      caption: sourcePhoto.caption,
+      year: sourcePhoto.year,
+      date: sourcePhoto.date,
+      place: sourcePhoto.place,
+      category: sourcePhoto.category,
+      isPrimary: true,
+      crop: { x: 0, y: 0, zoom: 1 },
+      tags: sourcePhoto.tags ? sourcePhoto.tags.map((t) => ({ ...t })) : [],
+    };
+    const nextPhotos = [
+      ...person.photos.map((ph) => ({ ...ph, isPrimary: false })),
+      newPhoto,
+    ];
+    onUpdatePerson(person.id, { photos: nextPhotos });
+    setShowArchivePicker(false);
+    setCroppingPhoto(newPhoto);
+  };
+
   const handleUpdatePhotoMeta = (
     ownerId: string,
     photoId: string,
     patch: Partial<PhotoAttachment>
   ) => {
     if (ownerId === '__archive__') {
+      const archPh = (tree.archivePhotos || []).find((ph) => ph.id === photoId);
+      if (archPh?.dataUrl && onUpdateSharedPhoto) {
+        onUpdateSharedPhoto(archPh.dataUrl, patch);
+        return;
+      }
       onUpdateArchivePhotos?.((curr) =>
         curr.map((ph) => (ph.id === photoId ? { ...ph, ...patch } : ph))
       );
@@ -327,6 +499,11 @@ export function PersonInspector({
     }
     const owner = tree.persons[ownerId];
     if (!owner) return;
+    const target = owner.photos.find((ph) => ph.id === photoId);
+    if (target?.dataUrl && onUpdateSharedPhoto) {
+      onUpdateSharedPhoto(target.dataUrl, patch);
+      return;
+    }
     const updated = owner.photos.map((ph) => (ph.id === photoId ? { ...ph, ...patch } : ph));
     onUpdatePerson(ownerId, { photos: updated });
   };
@@ -346,34 +523,53 @@ export function PersonInspector({
       h: frame.h,
     };
     if (ownerId === '__archive__') {
-      onUpdateArchivePhotos?.((curr) =>
-        curr.map((ph) => {
-          if (ph.id !== photoId) return ph;
-          const filtered = (ph.tags || []).filter((t) => t.personId !== targetPersonId);
-          return { ...ph, tags: [...filtered, newTag] };
-        })
-      );
+      const archPh = (tree.archivePhotos || []).find((ph) => ph.id === photoId);
+      if (archPh?.dataUrl && onUpdateSharedPhoto) {
+        const filtered = (archPh.tags || []).filter((t) => t.personId !== targetPersonId);
+        onUpdateSharedPhoto(archPh.dataUrl, { tags: [...filtered, newTag] });
+      } else {
+        onUpdateArchivePhotos?.((curr) =>
+          curr.map((ph) => {
+            if (ph.id !== photoId) return ph;
+            const filtered = (ph.tags || []).filter((t) => t.personId !== targetPersonId);
+            return { ...ph, tags: [...filtered, newTag] };
+          })
+        );
+      }
       setPendingTagFrame(null);
       setTagPickerQuery('');
       return;
     }
     const owner = tree.persons[ownerId];
     if (!owner) return;
-    const updated = owner.photos.map((ph) => {
-      if (ph.id !== photoId) return ph;
-      const filtered = (ph.tags || []).filter((t) => t.personId !== targetPersonId);
-      return {
-        ...ph,
-        tags: [...filtered, newTag],
-      };
-    });
-    onUpdatePerson(ownerId, { photos: updated });
+    const target = owner.photos.find((ph) => ph.id === photoId);
+    if (target?.dataUrl && onUpdateSharedPhoto) {
+      const filtered = (target.tags || []).filter((t) => t.personId !== targetPersonId);
+      onUpdateSharedPhoto(target.dataUrl, { tags: [...filtered, newTag] });
+    } else {
+      const updated = owner.photos.map((ph) => {
+        if (ph.id !== photoId) return ph;
+        const filtered = (ph.tags || []).filter((t) => t.personId !== targetPersonId);
+        return {
+          ...ph,
+          tags: [...filtered, newTag],
+        };
+      });
+      onUpdatePerson(ownerId, { photos: updated });
+    }
     setPendingTagFrame(null);
     setTagPickerQuery('');
   };
 
   const handleRemovePhotoTag = (ownerId: string, photoId: string, tagId: string) => {
     if (ownerId === '__archive__') {
+      const archPh = (tree.archivePhotos || []).find((ph) => ph.id === photoId);
+      if (archPh?.dataUrl && onUpdateSharedPhoto) {
+        onUpdateSharedPhoto(archPh.dataUrl, {
+          tags: (archPh.tags || []).filter((t) => t.id !== tagId),
+        });
+        return;
+      }
       onUpdateArchivePhotos?.((curr) =>
         curr.map((ph) =>
           ph.id === photoId
@@ -385,6 +581,13 @@ export function PersonInspector({
     }
     const owner = tree.persons[ownerId];
     if (!owner) return;
+    const target = owner.photos.find((ph) => ph.id === photoId);
+    if (target?.dataUrl && onUpdateSharedPhoto) {
+      onUpdateSharedPhoto(target.dataUrl, {
+        tags: (target.tags || []).filter((t) => t.id !== tagId),
+      });
+      return;
+    }
     const updated = owner.photos.map((ph) => {
       if (ph.id !== photoId) return ph;
       return {
@@ -502,6 +705,18 @@ export function PersonInspector({
                   onChange={handlePhotoUpload}
                 />
               </label>
+              <button
+                type="button"
+                onClick={() => {
+                  setArchivePickerQuery('');
+                  setShowArchivePicker(true);
+                }}
+                title="Выбрать фото из общего фотоархива"
+                aria-label="Выбрать фото из общего фотоархива"
+                className="absolute -right-1.5 -top-1.5 flex h-7 w-7 items-center justify-center rounded-full border border-stone-200 bg-white text-stone-700 shadow-xs hover:text-[#8B261D] cursor-pointer"
+              >
+                <FolderOpen size={12} />
+              </button>
               {primaryPhotoObj && (
                 <button
                   type="button"
@@ -1701,22 +1916,41 @@ export function PersonInspector({
                 </div>
               </div>
 
-              <label className="flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-stone-300 bg-white px-4 py-5 text-center hover:border-[#8B261D] transition-colors">
-                <Camera size={22} className="text-[#8B261D]" />
-                <span className="text-[14.5px] font-medium text-stone-800">
-                  {isUploadingPhoto ? 'Обработка снимков...' : 'Загрузить и кадрировать фото'}
-                </span>
-                <span className="text-[13px] text-stone-500">
-                  JPEG, PNG, WebP · нажмите на снимок для просмотра или отметьте персон рамкой
-                </span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  className="hidden"
-                  onChange={handlePhotoUpload}
-                />
-              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <label className="flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-stone-300 bg-white px-4 py-4 text-center hover:border-[#8B261D] transition-colors">
+                  <Camera size={21} className="text-[#8B261D]" />
+                  <span className="text-[14.5px] font-medium text-stone-800">
+                    {isUploadingPhoto ? 'Обработка снимков...' : 'Загрузить и кадрировать фото'}
+                  </span>
+                  <span className="text-[12.5px] text-stone-500">
+                    JPEG, PNG, WebP с устройства
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="hidden"
+                    onChange={handlePhotoUpload}
+                  />
+                </label>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setArchivePickerQuery('');
+                    setShowArchivePicker(true);
+                  }}
+                  className="flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-stone-300 bg-white px-4 py-4 text-center hover:border-[#8B261D] transition-colors"
+                >
+                  <FolderOpen size={21} className="text-[#8B261D]" />
+                  <span className="text-[14.5px] font-medium text-stone-800">
+                    Выбрать из фотоархива
+                  </span>
+                  <span className="text-[12.5px] text-stone-500">
+                    Общий архив и семейные снимки · с кадрированием
+                  </span>
+                </button>
+              </div>
 
               {(() => {
                 const searching = photoPersonSearch.trim().length > 0;
@@ -2098,6 +2332,142 @@ export function PersonInspector({
           onSave={handleSaveCroppedPhoto}
           onClose={() => setCroppingPhoto(null)}
         />
+      )}
+
+      {/* Archive Photo Picker Modal */}
+      {showArchivePicker && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/65 p-4"
+          onClick={() => setShowArchivePicker(false)}
+        >
+          <div
+            className="flex max-h-[86vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-stone-200 bg-[#FBF9F5] shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-stone-200 bg-white px-4 py-3.5">
+              <div>
+                <h3 className="font-editorial text-xl font-semibold text-stone-900">
+                  Выбрать фото из фотоархива
+                </h3>
+                <p className="text-[13px] text-stone-500">
+                  Нажмите на снимок, чтобы назначить его портретом и при необходимости кадрировать лицо
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowArchivePicker(false)}
+                aria-label="Закрыть выбор из фотоархива"
+                className="rounded p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-700 cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 border-b border-stone-200 bg-white/80 px-4 py-2.5">
+              <div className="flex min-w-[200px] flex-1 items-center rounded-md border border-stone-200 bg-white px-2.5 py-1.5">
+                <Search size={14} className="mr-1.5 shrink-0 text-stone-400" />
+                <input
+                  type="text"
+                  value={archivePickerQuery}
+                  onChange={(e) => setArchivePickerQuery(e.target.value)}
+                  placeholder="Поиск по подписи, году или персоне..."
+                  className="w-full bg-transparent text-[15px] text-stone-900 placeholder:text-stone-400 focus:outline-none"
+                />
+                {archivePickerQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setArchivePickerQuery('')}
+                    className="text-stone-400 hover:text-stone-700 cursor-pointer"
+                  >
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+
+              <div className="inline-flex rounded-md border border-stone-200 bg-stone-100 p-0.5 text-[13px]">
+                <button
+                  type="button"
+                  onClick={() => setArchivePickerScope('all')}
+                  className={`rounded px-2.5 py-1 font-medium transition-colors cursor-pointer ${
+                    archivePickerScope === 'all'
+                      ? 'bg-white text-stone-900 shadow-xs'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
+                >
+                  Все снимки
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setArchivePickerScope('archive')}
+                  className={`rounded px-2.5 py-1 font-medium transition-colors cursor-pointer ${
+                    archivePickerScope === 'archive'
+                      ? 'bg-white text-stone-900 shadow-xs'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
+                >
+                  Общий архив ({(tree.archivePhotos || []).length})
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4">
+              {archivePickerItems.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-10 text-center text-stone-500">
+                  <ImageIcon size={28} className="mb-2 text-stone-300" />
+                  <p className="text-[14.5px]">
+                    {archivePickerQuery
+                      ? 'Подходящие снимки не найдены.'
+                      : 'В фотоархиве пока нет снимков.'}
+                  </p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  {archivePickerItems.map((item) => {
+                    const alreadyInCard = person.photos.some(
+                      (ph) => ph.dataUrl === item.photo.dataUrl
+                    );
+                    return (
+                      <button
+                        key={item.key}
+                        type="button"
+                        onClick={() => handlePickPhotoFromArchive(item.photo)}
+                        className={`group flex flex-col overflow-hidden rounded-lg border bg-white text-left transition-all cursor-pointer hover:border-[#8B261D] hover:shadow-md ${
+                          alreadyInCard ? 'border-[#15803D]/60' : 'border-stone-200'
+                        }`}
+                      >
+                        <div className="relative aspect-square w-full overflow-hidden bg-stone-100">
+                          <img
+                            src={item.photo.dataUrl}
+                            alt={item.photo.caption || 'Снимок из архива'}
+                            className="h-full w-full object-cover transition-transform duration-200 group-hover:scale-105"
+                          />
+                          <span className="absolute left-1.5 top-1.5 rounded bg-stone-900/75 px-1.5 py-0.5 text-[11px] text-white">
+                            {item.isArchive ? 'Фотоархив' : item.sourceLabel}
+                          </span>
+                          {alreadyInCard && (
+                            <span className="absolute right-1.5 top-1.5 rounded bg-[#15803D] px-1.5 py-0.5 text-[11px] font-medium text-white">
+                              В карточке
+                            </span>
+                          )}
+                        </div>
+                        <div className="p-2 space-y-0.5">
+                          <div className="truncate text-[13px] font-medium text-stone-800">
+                            {item.photo.caption || 'Без подписи'}
+                          </div>
+                          {item.photo.year && (
+                            <div className="font-editorial tabular-nums text-[12px] text-stone-500">
+                              {item.photo.year}
+                            </div>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Photo Lightbox Modal */}

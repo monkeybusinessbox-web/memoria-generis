@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  HardDrive,
+  Lock,
+  Package,
+  X,
+} from 'lucide-react';
 import { ArchiveView } from './components/ArchiveView';
 import { PersonInspector } from './components/PersonInspector';
 import { PhotoArchiveView } from './components/PhotoArchiveView';
@@ -13,12 +21,15 @@ import {
   ParentChildLink,
   Person,
   PhotoAttachment,
+  PhotoPersonTag,
   TreeDocument,
   TreeViewMode,
   Union,
   VerificationStatus,
 } from './types/genealogy';
-import { createId, derivePatronymic, normalizeTreeDates } from './utils/dateUtils';
+import type { TagFrameRect } from './components/PhotoTagFrameLayer';
+import { createId, derivePatronymic, formatBytes, normalizeTreeDates } from './utils/dateUtils';
+import { collectExternalAssetSizes, estimateProjectZipBytes } from './utils/exportImport';
 import { GeoPoint, normalizePlaceName } from './utils/geocoding';
 import { convertQuotesToGuillemets } from './utils/quoteUtils';
 import {
@@ -26,6 +37,9 @@ import {
   saveTreeToLocalBrowser,
 } from './utils/storage';
 import { computeTreeLayout, getNodeDimensions, PositionedNode } from './utils/treeLayout';
+import { validateTreeLogic } from './utils/treeValidation';
+import { getPageHref, getPageTitle, getTabFromLocation } from './utils/routes';
+import { APP_VERSION } from './version';
 
 const MAX_UNDO_STEPS = 30;
 
@@ -33,39 +47,106 @@ export default function App() {
   const [history, setHistory] = useState<{
     present: TreeDocument | null;
     past: TreeDocument[];
-  }>({ present: null, past: [] });
+    future: TreeDocument[];
+  }>({ present: null, past: [], future: [] });
   const tree = history.present;
   const canUndo = history.past.length > 0;
+  const canRedo = history.future.length > 0;
   const lastCoalesceRef = useRef<{ key: string; at: number } | null>(null);
 
-  const [activeTab, setActiveTab] = useState<AppWorkspaceTab>('tree');
+  const [activeTab, setActiveTabState] = useState<AppWorkspaceTab>(() => getTabFromLocation());
   const [viewMode, setViewMode] = useState<TreeViewMode>('vertical');
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
   const [editingPersonId, setEditingPersonId] = useState<string | null>(null);
+  const [focusPersonRequest, setFocusPersonRequest] = useState<{
+    personId: string;
+    nonce: number;
+  } | null>(null);
+  const [validationOpen, setValidationOpen] = useState(false);
+  const [storageStats, setStorageStats] = useState<{ usage: number; quota: number } | null>(null);
+  const [externalAssetSizes, setExternalAssetSizes] = useState<Record<string, number>>({});
   const saveTimerRef = useRef<number | null>(null);
+
+  const setActiveTab = useCallback((nextTab: AppWorkspaceTab) => {
+    setActiveTabState(nextTab);
+    setValidationOpen(false);
+    if (typeof window !== 'undefined') {
+      const targetPath = getPageHref(nextTab);
+      const currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
+      if (currentPath !== targetPath || window.location.hash) {
+        window.history.pushState({ tab: nextTab }, '', targetPath);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof document !== 'undefined') {
+      document.title = getPageTitle(activeTab);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    const syncFromUrl = () => {
+      setActiveTabState(getTabFromLocation());
+      setValidationOpen(false);
+    };
+    window.addEventListener('popstate', syncFromUrl);
+    window.addEventListener('hashchange', syncFromUrl);
+    return () => {
+      window.removeEventListener('popstate', syncFromUrl);
+      window.removeEventListener('hashchange', syncFromUrl);
+    };
+  }, []);
+
+  const refreshStorageEstimate = useCallback(async () => {
+    if (typeof navigator === 'undefined' || !navigator.storage?.estimate) return;
+    try {
+      const est = await navigator.storage.estimate();
+      if (typeof est.usage === 'number' && typeof est.quota === 'number') {
+        setStorageStats({ usage: est.usage, quota: est.quota });
+      }
+    } catch {
+      // Ignore storage estimate unavailability
+    }
+  }, []);
 
   useEffect(() => {
     let mounted = true;
     loadTreeFromLocalBrowser().then((loaded) => {
       if (!mounted) return;
       const initial = loaded || createSampleTree();
-      setHistory({ present: initial, past: [] });
+      setHistory({ present: initial, past: [], future: [] });
+      refreshStorageEstimate();
     });
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [refreshStorageEstimate]);
+
+  useEffect(() => {
+    if (!tree) return;
+    let active = true;
+    collectExternalAssetSizes(tree).then((sizes) => {
+      if (active && Object.keys(sizes).length > 0) {
+        setExternalAssetSizes(sizes);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [tree]);
 
   useEffect(() => {
     if (!tree) return;
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = window.setTimeout(() => {
-      saveTreeToLocalBrowser(tree);
+    saveTimerRef.current = window.setTimeout(async () => {
+      await saveTreeToLocalBrowser(tree);
+      refreshStorageEstimate();
     }, 220);
     return () => {
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     };
-  }, [tree]);
+  }, [refreshStorageEstimate, tree]);
 
   useEffect(() => {
     if (!tree) return;
@@ -128,13 +209,13 @@ export default function App() {
         const next = updater(curr.present);
         if (next === curr.present) return curr;
         if (isCoalescing) {
-          return { ...curr, present: next };
+          return { ...curr, present: next, future: [] };
         }
         const nextPast =
           curr.past.length >= MAX_UNDO_STEPS
             ? [...curr.past.slice(curr.past.length - MAX_UNDO_STEPS + 1), curr.present]
             : [...curr.past, curr.present];
-        return { present: next, past: nextPast };
+        return { present: next, past: nextPast, future: [] };
       });
     },
     []
@@ -143,19 +224,40 @@ export default function App() {
   const handleUndo = useCallback(() => {
     lastCoalesceRef.current = null;
     setHistory((curr) => {
-      if (curr.past.length === 0) return curr;
+      if (curr.past.length === 0 || !curr.present) return curr;
       const previous = curr.past[curr.past.length - 1];
+      const nextFuture =
+        curr.future.length >= MAX_UNDO_STEPS
+          ? [...curr.future.slice(curr.future.length - MAX_UNDO_STEPS + 1), curr.present]
+          : [...curr.future, curr.present];
       return {
         present: previous,
         past: curr.past.slice(0, curr.past.length - 1),
+        future: nextFuture,
+      };
+    });
+  }, []);
+
+  const handleRedo = useCallback(() => {
+    lastCoalesceRef.current = null;
+    setHistory((curr) => {
+      if (curr.future.length === 0 || !curr.present) return curr;
+      const next = curr.future[curr.future.length - 1];
+      const nextPast =
+        curr.past.length >= MAX_UNDO_STEPS
+          ? [...curr.past.slice(curr.past.length - MAX_UNDO_STEPS + 1), curr.present]
+          : [...curr.past, curr.present];
+      return {
+        present: next,
+        past: nextPast,
+        future: curr.future.slice(0, curr.future.length - 1),
       };
     });
   }, []);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
-      if (e.key.toLowerCase() !== 'z' && e.code !== 'KeyZ') return;
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -166,13 +268,24 @@ export default function App() {
       ) {
         return;
       }
-      if (!canUndo) return;
-      e.preventDefault();
-      handleUndo();
+
+      const keyLower = e.key.toLowerCase();
+      const isZ = keyLower === 'z' || e.code === 'KeyZ';
+      const isY = keyLower === 'y' || e.code === 'KeyY';
+
+      if (isZ && !e.shiftKey) {
+        if (!canUndo) return;
+        e.preventDefault();
+        handleUndo();
+      } else if ((isZ && e.shiftKey) || (isY && !e.shiftKey)) {
+        if (!canRedo) return;
+        e.preventDefault();
+        handleRedo();
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [canUndo, handleUndo]);
+  }, [canRedo, canUndo, handleRedo, handleUndo]);
 
   const handleUpdatePerson = useCallback(
     (personId: string, patch: Partial<Person>) => {
@@ -203,21 +316,23 @@ export default function App() {
     [updateTree]
   );
 
-  const handleDeletePerson = useCallback(
-    (personId: string) => {
+  const handleDeletePersons = useCallback(
+    (personIds: string[]) => {
+      const idSet = new Set(personIds);
+      if (idSet.size === 0) return;
       updateTree((prev) => {
         const nextPersons: Record<string, Person> = {};
         for (const [pid, p] of Object.entries(prev.persons)) {
-          if (pid === personId) continue;
+          if (idSet.has(pid)) continue;
           const hasTaggedPhoto = p.photos.some((ph) =>
-            ph.tags?.some((t) => t.personId === personId)
+            ph.tags?.some((t) => idSet.has(t.personId))
           );
           nextPersons[pid] = hasTaggedPhoto
             ? {
                 ...p,
                 photos: p.photos.map((ph) =>
                   ph.tags
-                    ? { ...ph, tags: ph.tags.filter((t) => t.personId !== personId) }
+                    ? { ...ph, tags: ph.tags.filter((t) => !idSet.has(t.personId)) }
                     : ph
                 ),
               }
@@ -225,23 +340,30 @@ export default function App() {
         }
         const nextArchivePhotos = (prev.archivePhotos || []).map((ph) =>
           ph.tags
-            ? { ...ph, tags: ph.tags.filter((t) => t.personId !== personId) }
+            ? { ...ph, tags: ph.tags.filter((t) => !idSet.has(t.personId)) }
             : ph
         );
         return {
           ...prev,
           persons: nextPersons,
-          unions: prev.unions.filter((u) => !u.partnerIds.includes(personId)),
+          unions: prev.unions.filter((u) => !u.partnerIds.some((id) => idSet.has(id))),
           parentChildLinks: prev.parentChildLinks.filter(
-            (l) => l.parentId !== personId && l.childId !== personId
+            (l) => !idSet.has(l.parentId) && !idSet.has(l.childId)
           ),
           archivePhotos: nextArchivePhotos,
         };
       });
-      setSelectedPersonId((curr) => (curr === personId ? null : curr));
-      setEditingPersonId((curr) => (curr === personId ? null : curr));
+      setSelectedPersonId((curr) => (curr && idSet.has(curr) ? null : curr));
+      setEditingPersonId((curr) => (curr && idSet.has(curr) ? null : curr));
     },
     [updateTree]
+  );
+
+  const handleDeletePerson = useCallback(
+    (personId: string) => {
+      handleDeletePersons([personId]);
+    },
+    [handleDeletePersons]
   );
 
   const handleAddStandalonePerson = useCallback(() => {
@@ -936,6 +1058,146 @@ export default function App() {
     [updateTree]
   );
 
+  const handleSavePersonCroppedPhoto = useCallback(
+    (
+      personId: string,
+      originalDataUrl: string,
+      updatedPhoto: PhotoAttachment,
+      tagFrame?: TagFrameRect
+    ) => {
+      updateTree((prev) => {
+        const targetPerson = prev.persons[personId];
+        if (!targetPerson) return prev;
+
+        const matchUrls = new Set<string>(
+          [originalDataUrl, updatedPhoto.dataUrl].filter(Boolean)
+        );
+        const tagByPerson = new Map<string, PhotoPersonTag>();
+        const collectTags = (tags?: PhotoPersonTag[]) => {
+          for (const t of tags || []) {
+            tagByPerson.set(t.personId, { ...t });
+          }
+        };
+
+        for (const archPh of prev.archivePhotos || []) {
+          if (matchUrls.has(archPh.dataUrl)) collectTags(archPh.tags);
+        }
+        for (const p of Object.values(prev.persons)) {
+          for (const ph of p.photos) {
+            if (matchUrls.has(ph.dataUrl)) collectTags(ph.tags);
+          }
+        }
+        collectTags(updatedPhoto.tags);
+
+        if (tagFrame) {
+          tagByPerson.set(personId, {
+            id: createId('tag'),
+            personId,
+            x: tagFrame.x,
+            y: tagFrame.y,
+            w: tagFrame.w,
+            h: tagFrame.h,
+          });
+        }
+
+        const mergedTags = Array.from(tagByPerson.values());
+        const nextPersons: Record<string, Person> = {};
+
+        for (const [pid, p] of Object.entries(prev.persons)) {
+          if (pid === personId) {
+            nextPersons[pid] = {
+              ...p,
+              photos: p.photos.map((ph) =>
+                ph.id === updatedPhoto.id
+                  ? { ...updatedPhoto, tags: mergedTags.map((t) => ({ ...t })) }
+                  : matchUrls.has(ph.dataUrl)
+                  ? { ...ph, tags: mergedTags.map((t) => ({ ...t })) }
+                  : ph
+              ),
+            };
+          } else {
+            let changed = false;
+            const mappedPhotos = p.photos.map((ph) => {
+              if (!matchUrls.has(ph.dataUrl)) return ph;
+              changed = true;
+              return { ...ph, tags: mergedTags.map((t) => ({ ...t })) };
+            });
+            nextPersons[pid] = changed ? { ...p, photos: mappedPhotos } : p;
+          }
+        }
+
+        const nextArchivePhotos = (prev.archivePhotos || []).map((ph) =>
+          matchUrls.has(ph.dataUrl)
+            ? { ...ph, tags: mergedTags.map((t) => ({ ...t })) }
+            : ph
+        );
+
+        return {
+          ...prev,
+          persons: nextPersons,
+          archivePhotos: nextArchivePhotos,
+        };
+      });
+    },
+    [updateTree]
+  );
+
+  const handleUpdateSharedPhoto = useCallback(
+    (dataUrl: string, patch: Partial<PhotoAttachment>) => {
+      if (!dataUrl) return;
+      updateTree((prev) => {
+        const nextPersons: Record<string, Person> = {};
+        for (const [pid, p] of Object.entries(prev.persons)) {
+          let changed = false;
+          const nextPhotos = p.photos.map((ph) => {
+            if (ph.dataUrl !== dataUrl) return ph;
+            changed = true;
+            return { ...ph, ...patch };
+          });
+          nextPersons[pid] = changed ? { ...p, photos: nextPhotos } : p;
+        }
+        const nextArchivePhotos = (prev.archivePhotos || []).map((ph) =>
+          ph.dataUrl === dataUrl ? { ...ph, ...patch } : ph
+        );
+        return {
+          ...prev,
+          persons: nextPersons,
+          archivePhotos: nextArchivePhotos,
+        };
+      });
+    },
+    [updateTree]
+  );
+
+  const handleDeleteSharedPhoto = useCallback(
+    (dataUrl: string) => {
+      if (!dataUrl) return;
+      updateTree((prev) => {
+        const nextPersons: Record<string, Person> = {};
+        for (const [pid, p] of Object.entries(prev.persons)) {
+          const filtered = p.photos.filter((ph) => ph.dataUrl !== dataUrl);
+          if (filtered.length !== p.photos.length) {
+            if (filtered.length > 0 && !filtered.some((ph) => ph.isPrimary)) {
+              filtered[0] = { ...filtered[0], isPrimary: true };
+            }
+            nextPersons[pid] = { ...p, photos: filtered };
+          } else {
+            nextPersons[pid] = p;
+          }
+        }
+        const nextArchivePhotos = (prev.archivePhotos || []).filter(
+          (ph) => ph.dataUrl !== dataUrl
+        );
+        return {
+          ...prev,
+          persons: nextPersons,
+          archivePhotos: nextArchivePhotos,
+        };
+      });
+    },
+    [updateTree]
+  );
+
   const handleReplaceTree = useCallback(
     (next: TreeDocument) => {
       const normalized = normalizeTreeDates(next).tree;
@@ -1007,6 +1269,12 @@ export default function App() {
     [updateTree]
   );
 
+  const validationIssues = useMemo(() => (tree ? validateTreeLogic(tree) : []), [tree]);
+  const zipStats = useMemo(
+    () => (tree ? estimateProjectZipBytes(tree, externalAssetSizes) : { zipBytes: 0, rawBytes: 0 }),
+    [externalAssetSizes, tree]
+  );
+
   if (!tree) {
     return (
       <div className="flex h-screen items-center justify-center bg-[#FBF9F5] text-stone-600">
@@ -1016,6 +1284,13 @@ export default function App() {
   }
 
   const editingPerson = editingPersonId ? tree.persons[editingPersonId] || null : null;
+  const personCount = Object.keys(tree.persons).length;
+  const errorIssues = validationIssues.filter((i) => i.severity === 'error');
+  const warningIssues = validationIssues.filter((i) => i.severity !== 'error');
+  const storagePct =
+    storageStats && storageStats.quota > 0
+      ? Math.min(100, (storageStats.usage / storageStats.quota) * 100)
+      : 0;
 
   return (
     <div className="flex h-[100dvh] flex-col overflow-hidden bg-[#FBF9F5] text-[#1C1917]">
@@ -1027,12 +1302,15 @@ export default function App() {
             tree={tree}
             viewMode={viewMode}
             selectedPersonId={selectedPersonId}
+            editingPersonOpen={Boolean(editingPerson)}
+            focusPersonRequest={focusPersonRequest}
             onViewModeChange={setViewMode}
             onSelectPerson={setSelectedPersonId}
             onEditPerson={(id) => {
               setSelectedPersonId(id);
               setEditingPersonId(id);
             }}
+            onDeletePersons={handleDeletePersons}
             onMovePerson={handleMovePerson}
             onMovePersons={handleMovePersons}
             onResetPositions={handleResetPositions}
@@ -1047,6 +1325,8 @@ export default function App() {
             onGoToImport={() => setActiveTab('archive')}
             canUndo={canUndo}
             onUndo={handleUndo}
+            canRedo={canRedo}
+            onRedo={handleRedo}
           />
         )}
 
@@ -1074,6 +1354,8 @@ export default function App() {
             tree={tree}
             onUpdatePerson={handleUpdatePerson}
             onUpdateArchivePhotos={handleUpdateArchivePhotos}
+            onUpdateSharedPhoto={handleUpdateSharedPhoto}
+            onDeleteSharedPhoto={handleDeleteSharedPhoto}
             onOpenPersonInTree={(pid) => {
               setSelectedPersonId(pid);
               setEditingPersonId(pid);
@@ -1122,9 +1404,202 @@ export default function App() {
         )}
       </main>
 
-      <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-stone-200 bg-[#FBF9F5] px-4 py-1.5 text-[12px] sm:text-[12.5px] text-stone-500">
-        <span>{tree.title || 'Семейное древо'}</span>
-        <span>Локальный семейный архив · Данные хранятся только в вашем браузере</span>
+      <footer className="font-ui-mono relative z-30 flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 border-t border-stone-200 bg-[#FBF9F5] px-4 py-1.5 text-[10.8px] sm:text-[11.2px] text-stone-500">
+        <div
+          className="flex items-center gap-1.5 text-stone-500"
+          title="Текущая версия приложения Memoria Generis"
+        >
+          <span>Версия</span>
+          <span className="tabular-nums font-medium text-stone-700">v{APP_VERSION}</span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 ml-auto">
+          {/* Estimated ZIP project weight */}
+          <span
+            className="inline-flex items-center gap-1.5 text-stone-600 whitespace-nowrap"
+            title={`Примерный вес текущего проекта после экспорта в ZIP-архив: ~${formatBytes(
+              zipStats.zipBytes
+            )} (исходные данные в браузере: ~${formatBytes(zipStats.rawBytes)})`}
+          >
+            <Package size={12} className="text-stone-400 shrink-0" />
+            <span>
+              ZIP:{' '}
+              <span className="tabular-nums font-medium text-stone-700">
+                ~{formatBytes(zipStats.zipBytes)}
+              </span>
+            </span>
+          </span>
+
+          {/* Browser storage usage meter */}
+          {storageStats && storageStats.quota > 0 && (
+            <div
+              className="inline-flex items-center gap-1.5 text-stone-600 whitespace-nowrap"
+              title={`Память браузера, используемая приложением: ${formatBytes(
+                storageStats.usage
+              )} из ${formatBytes(storageStats.quota)} доступных`}
+            >
+              <HardDrive size={12} className="text-stone-400 shrink-0" />
+              <div className="h-1.5 w-14 sm:w-20 overflow-hidden rounded-full bg-stone-200">
+                <div
+                  className={`h-full rounded-full transition-all ${
+                    storagePct > 85
+                      ? 'bg-[#8B261D]'
+                      : storagePct > 60
+                      ? 'bg-amber-600'
+                      : 'bg-[#15803D]'
+                  }`}
+                  style={{
+                    width: `${storageStats.usage > 0 ? Math.max(4, storagePct) : 0}%`,
+                  }}
+                />
+              </div>
+              <span className="tabular-nums">
+                {formatBytes(storageStats.usage)} / {formatBytes(storageStats.quota)}
+              </span>
+            </div>
+          )}
+
+          {/* Logic validation button + upward popover */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setValidationOpen((v) => !v)}
+              className={`inline-flex items-center gap-1.5 rounded px-2 py-0.5 font-medium transition-colors cursor-pointer ${
+                errorIssues.length > 0
+                  ? 'bg-red-50 text-[#8B261D] border border-red-200 hover:bg-red-100/80'
+                  : warningIssues.length > 0
+                  ? 'bg-amber-50 text-amber-900 border border-amber-200 hover:bg-amber-100'
+                  : 'text-stone-600 hover:bg-stone-100'
+              }`}
+              title="Автоматическая проверка логических ошибок, отчеств, дат и родственных связей"
+            >
+              {errorIssues.length > 0 ? (
+                <AlertTriangle size={12} className="text-[#8B261D] shrink-0" />
+              ) : warningIssues.length > 0 ? (
+                <AlertTriangle size={12} className="text-amber-700 shrink-0" />
+              ) : (
+                <CheckCircle2 size={12} className="text-[#15803D] shrink-0" />
+              )}
+              <span>
+                {errorIssues.length > 0
+                  ? warningIssues.length > 0
+                    ? `Ошибки: ${errorIssues.length} · Замечания: ${warningIssues.length}`
+                    : `Ошибки: ${errorIssues.length}`
+                  : warningIssues.length > 0
+                  ? `Проверка: ${warningIssues.length} замечаний`
+                  : 'Ошибок нет'}
+              </span>
+            </button>
+
+            {validationOpen && (
+              <div className="font-editorial absolute right-0 bottom-full z-40 mb-2 w-[min(92vw,420px)] rounded-xl border border-stone-200 bg-white p-3.5 shadow-xl space-y-3">
+                <div className="flex items-center justify-between border-b border-stone-100 pb-2">
+                  <span className="text-[14px] font-semibold text-stone-800">
+                    Логическая проверка древа
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setValidationOpen(false)}
+                    className="text-stone-400 hover:text-stone-700 cursor-pointer"
+                  >
+                    <X size={15} />
+                  </button>
+                </div>
+
+                {validationIssues.length === 0 ? (
+                  <p className="py-2 text-[13.5px] text-stone-600">
+                    Даты рождения, кончины, отчества, браки и родственные поколения согласованы — противоречий не обнаружено.
+                  </p>
+                ) : (
+                  <div className="max-h-80 overflow-y-auto space-y-3 pr-1">
+                    {errorIssues.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="text-[11.5px] font-semibold uppercase tracking-[0.06em] text-[#8B261D]">
+                          Ошибки ({errorIssues.length})
+                        </div>
+                        <div className="space-y-1.5">
+                          {errorIssues.map((issue) => (
+                            <button
+                              key={issue.id}
+                              type="button"
+                              onClick={() => {
+                                setValidationOpen(false);
+                                setActiveTab('tree');
+                                setSelectedPersonId(issue.personId);
+                                setEditingPersonId(issue.personId);
+                                setFocusPersonRequest({
+                                  personId: issue.personId,
+                                  nonce: Date.now(),
+                                });
+                              }}
+                              className="w-full rounded-lg border border-red-200/80 bg-[#FBF9F5] p-2.5 text-left hover:border-[#8B261D]/55 transition-colors cursor-pointer"
+                            >
+                              <div className="flex items-center gap-1.5 text-[13.5px] font-semibold text-stone-900">
+                                <AlertTriangle
+                                  size={13}
+                                  className="text-[#8B261D] shrink-0"
+                                />
+                                <span>{issue.title}</span>
+                              </div>
+                              <p className="mt-1 text-[12.5px] leading-snug text-stone-600">
+                                {issue.description}
+                              </p>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {warningIssues.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="text-[11.5px] font-semibold uppercase tracking-[0.06em] text-amber-800">
+                          Предупреждения ({warningIssues.length})
+                        </div>
+                        <div className="space-y-1.5">
+                          {warningIssues.map((issue) => (
+                            <button
+                              key={issue.id}
+                              type="button"
+                              onClick={() => {
+                                setValidationOpen(false);
+                                setActiveTab('tree');
+                                setSelectedPersonId(issue.personId);
+                                setEditingPersonId(issue.personId);
+                                setFocusPersonRequest({
+                                  personId: issue.personId,
+                                  nonce: Date.now(),
+                                });
+                              }}
+                              className="w-full rounded-lg border border-stone-200 bg-[#FBF9F5] p-2.5 text-left hover:border-amber-400 transition-colors cursor-pointer"
+                            >
+                              <div className="flex items-center gap-1.5 text-[13.5px] font-semibold text-stone-900">
+                                <AlertTriangle
+                                  size={13}
+                                  className="text-amber-600 shrink-0"
+                                />
+                                <span>{issue.title}</span>
+                              </div>
+                              <p className="mt-1 text-[12.5px] leading-snug text-stone-600">
+                                {issue.description}
+                              </p>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="inline-flex items-center gap-1.5 text-stone-600 whitespace-nowrap">
+            <Lock size={12} className="text-[#15803D]" />
+            <span>Локально</span>
+            <span aria-hidden="true">·</span>
+            <span className="tabular-nums">{personCount} чел.</span>
+          </div>
+        </div>
       </footer>
 
       {/* Centered Large Editing Modal */}
@@ -1143,6 +1618,8 @@ export default function App() {
               onClose={() => setEditingPersonId(null)}
               onUpdatePerson={handleUpdatePerson}
               onUpdateArchivePhotos={handleUpdateArchivePhotos}
+              onSaveCroppedPhoto={handleSavePersonCroppedPhoto}
+              onUpdateSharedPhoto={handleUpdateSharedPhoto}
               onDeletePerson={handleDeletePerson}
               onSelectPerson={(id) => {
                 setSelectedPersonId(id);

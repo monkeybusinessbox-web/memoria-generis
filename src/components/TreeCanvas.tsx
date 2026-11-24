@@ -6,13 +6,12 @@ import {
   ArrowUp,
   ArrowUpDown,
   Baby,
-  CheckCircle2,
   Focus,
   Heart,
   Link2,
-  Lock,
   Magnet,
   Pencil,
+  Redo2,
   Ruler,
   Search,
   SquareDashedMousePointer,
@@ -46,7 +45,6 @@ import {
 } from '../utils/dateUtils';
 import { computeBloodRelatives, computeLineageColors } from '../utils/lineageColors';
 import { computeTreeLayout } from '../utils/treeLayout';
-import { validateTreeLogic } from '../utils/treeValidation';
 import { CroppedCircleAvatar } from './PhotoCropModal';
 import { PhotoTagFrameLayer } from './PhotoTagFrameLayer';
 import { VerificationIcon, VerificationSelector } from './VerificationBadge';
@@ -55,9 +53,12 @@ interface TreeCanvasProps {
   tree: TreeDocument;
   viewMode: TreeViewMode;
   selectedPersonId: string | null;
+  editingPersonOpen?: boolean;
+  focusPersonRequest?: { personId: string; nonce: number } | null;
   onViewModeChange: (mode: TreeViewMode) => void;
   onSelectPerson: (id: string | null) => void;
   onEditPerson: (id: string) => void;
+  onDeletePersons?: (personIds: string[]) => void;
   onMovePerson: (
     personId: string,
     pos: { x: number; y: number },
@@ -86,9 +87,13 @@ interface TreeCanvasProps {
   onGoToImport: () => void;
   canUndo?: boolean;
   onUndo?: () => void;
+  canRedo?: boolean;
+  onRedo?: () => void;
 }
 
 const CORNER_RADIUS = 12;
+const MIN_ZOOM = 0.06;
+const MAX_ZOOM = 2.5;
 
 /**
  * Builds an SVG path through orthogonal waypoints where every corner has the same rounded radius.
@@ -145,9 +150,12 @@ export function TreeCanvas({
   tree,
   viewMode,
   selectedPersonId,
+  editingPersonOpen = false,
+  focusPersonRequest,
   onViewModeChange,
   onSelectPerson,
   onEditPerson,
+  onDeletePersons,
   onMovePerson,
   onMovePersons,
   onResetPositions,
@@ -162,11 +170,22 @@ export function TreeCanvas({
   onGoToImport,
   canUndo = false,
   onUndo,
+  canRedo = false,
+  onRedo,
 }: TreeCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const canvasLayerRef = useRef<HTMLDivElement>(null);
+  const zoomPctRef = useRef<HTMLSpanElement>(null);
+  const [, setPan] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(1);
   const [hasCenteredInitially, setHasCenteredInitially] = useState(false);
+
+  const currentCamRef = useRef({ x: 0, y: 0, zoom: 1 });
+  const targetCamRef = useRef({ x: 0, y: 0, zoom: 1 });
+  const rafCameraRef = useRef<number | null>(null);
+  const rafLastTimeRef = useRef<number>(0);
+  const camSpeedRef = useRef<number>(18);
+  const panVelocityRef = useRef({ vx: 0, vy: 0, lastX: 0, lastY: 0, lastTime: 0 });
 
   // Soft snapping toggle + active visual guide lines + equal-distance guides
   const [snapEnabled, setSnapEnabled] = useState(true);
@@ -251,10 +270,9 @@ export function TreeCanvas({
 
   const [activeUnionId, setActiveUnionId] = useState<string | null>(null);
   const [activeChildLinkId, setActiveChildLinkId] = useState<string | null>(null);
-  const [validationOpen, setValidationOpen] = useState(false);
+  const [pendingDeleteIds, setPendingDeleteIds] = useState<string[] | null>(null);
 
   const fullLineage = useMemo(() => computeLineageColors(tree), [tree]);
-  const validationIssues = useMemo(() => validateTreeLogic(tree), [tree]);
 
   useEffect(() => {
     if (!hideNonBlood) return;
@@ -339,33 +357,119 @@ export function TreeCanvas({
     [tree.persons, viewMode]
   );
 
-  const fitTreeToViewport = useCallback(() => {
-    const el = containerRef.current;
-    if (!el || personList.length === 0) return;
-    const rect = el.getBoundingClientRect();
-    const pad = 44;
-    const scaleX = (rect.width - pad * 2) / layout.bounds.width;
-    const scaleY = (rect.height - pad * 2) / layout.bounds.height;
-    const nextZoom = Math.max(0.32, Math.min(1.06, Math.min(scaleX, scaleY)));
-    const centerX = (layout.bounds.minX + layout.bounds.maxX) / 2;
-    const centerY = (layout.bounds.minY + layout.bounds.maxY) / 2;
-    setZoom(nextZoom);
-    setPan({
-      x: rect.width / 2 - centerX * nextZoom,
-      y: rect.height / 2 - centerY * nextZoom,
-    });
-  }, [layout.bounds, personList.length]);
+  const applyCameraTransform = useCallback((cam: { x: number; y: number; zoom: number }) => {
+    if (canvasLayerRef.current) {
+      canvasLayerRef.current.style.transform = `translate(${cam.x}px, ${cam.y}px) scale(${cam.zoom})`;
+    }
+    if (containerRef.current) {
+      containerRef.current.style.backgroundPosition = `${cam.x}px ${cam.y}px`;
+    }
+    if (zoomPctRef.current) {
+      zoomPctRef.current.textContent = `${Math.round(cam.zoom * 100)}%`;
+    }
+  }, []);
+
+  const stopCameraAnimation = useCallback(() => {
+    if (rafCameraRef.current !== null) {
+      cancelAnimationFrame(rafCameraRef.current);
+      rafCameraRef.current = null;
+    }
+    rafLastTimeRef.current = 0;
+  }, []);
+
+  const animateCameraTo = useCallback(
+    (nextX: number, nextY: number, nextZoom: number, immediate = false, speed = 16) => {
+      targetCamRef.current = { x: nextX, y: nextY, zoom: nextZoom };
+      camSpeedRef.current = speed;
+
+      if (immediate) {
+        stopCameraAnimation();
+        currentCamRef.current = { x: nextX, y: nextY, zoom: nextZoom };
+        applyCameraTransform(currentCamRef.current);
+        setPan({ x: nextX, y: nextY });
+        setZoom(nextZoom);
+        return;
+      }
+
+      if (rafCameraRef.current !== null) return;
+
+      rafLastTimeRef.current = performance.now();
+      const step = (now: number) => {
+        const dt = Math.min(0.05, Math.max(0.001, (now - rafLastTimeRef.current) / 1000));
+        rafLastTimeRef.current = now;
+
+        const cur = currentCamRef.current;
+        const tgt = targetCamRef.current;
+        const alpha = 1 - Math.exp(-camSpeedRef.current * dt);
+
+        const dx = tgt.x - cur.x;
+        const dy = tgt.y - cur.y;
+        const dz = tgt.zoom - cur.zoom;
+
+        if (Math.abs(dx) < 0.12 && Math.abs(dy) < 0.12 && Math.abs(dz) < 0.0004) {
+          currentCamRef.current = { ...tgt };
+          applyCameraTransform(currentCamRef.current);
+          rafCameraRef.current = null;
+          rafLastTimeRef.current = 0;
+          setPan({ x: tgt.x, y: tgt.y });
+          setZoom(tgt.zoom);
+          return;
+        }
+
+        currentCamRef.current = {
+          x: cur.x + dx * alpha,
+          y: cur.y + dy * alpha,
+          zoom: cur.zoom + dz * alpha,
+        };
+        applyCameraTransform(currentCamRef.current);
+        rafCameraRef.current = requestAnimationFrame(step);
+      };
+
+      rafCameraRef.current = requestAnimationFrame(step);
+    },
+    [applyCameraTransform, stopCameraAnimation]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (rafCameraRef.current !== null) {
+        cancelAnimationFrame(rafCameraRef.current);
+      }
+    };
+  }, []);
+
+  const fitTreeToViewport = useCallback(
+    (immediate = false) => {
+      const el = containerRef.current;
+      if (!el || personList.length === 0) return;
+      const rect = el.getBoundingClientRect();
+      const pad = 28;
+      const scaleX = (rect.width - pad * 2) / layout.bounds.width;
+      const scaleY = (rect.height - pad * 2) / layout.bounds.height;
+      const nextZoom = Math.max(MIN_ZOOM, Math.min(1.06, Math.min(scaleX, scaleY)));
+      const centerX = (layout.bounds.minX + layout.bounds.maxX) / 2;
+      const centerY = (layout.bounds.minY + layout.bounds.maxY) / 2;
+      animateCameraTo(
+        rect.width / 2 - centerX * nextZoom,
+        rect.height / 2 - centerY * nextZoom,
+        nextZoom,
+        immediate,
+        14
+      );
+    },
+    [animateCameraTo, layout.bounds, personList.length]
+  );
 
   useEffect(() => {
     if (!hasCenteredInitially && personList.length > 0) {
-      fitTreeToViewport();
+      fitTreeToViewport(true);
       setHasCenteredInitially(true);
     }
   }, [fitTreeToViewport, hasCenteredInitially, personList.length]);
 
   useEffect(() => {
     if (personList.length > 0) {
-      fitTreeToViewport();
+      fitTreeToViewport(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewMode]);
@@ -377,14 +481,46 @@ export function TreeCanvas({
       onSelectPerson(personId);
       if (!node || !el) return;
       const rect = el.getBoundingClientRect();
-      const targetZoom = Math.max(zoom, 0.94);
-      setZoom(targetZoom);
-      setPan({
-        x: rect.width / 2 - (node.x + node.width / 2) * targetZoom,
-        y: rect.height / 2 - (node.y + node.height / 2) * targetZoom,
-      });
+      const targetZoom = Math.max(targetCamRef.current.zoom, 0.94);
+      animateCameraTo(
+        rect.width / 2 - (node.x + node.width / 2) * targetZoom,
+        rect.height / 2 - (node.y + node.height / 2) * targetZoom,
+        targetZoom,
+        false,
+        13
+      );
     },
-    [layout.nodes, onSelectPerson, zoom]
+    [animateCameraTo, layout.nodes, onSelectPerson]
+  );
+
+  useEffect(() => {
+    if (!focusPersonRequest) return;
+    focusOnPerson(focusPersonRequest.personId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusPersonRequest?.nonce]);
+
+  const handleToolbarZoom = useCallback(
+    (factor: number) => {
+      const el = containerRef.current;
+      const prev = targetCamRef.current;
+      const nextZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, prev.zoom * factor));
+      if (!el) {
+        animateCameraTo(prev.x, prev.y, nextZoom, false, 16);
+        return;
+      }
+      const rect = el.getBoundingClientRect();
+      const cx = rect.width / 2;
+      const cy = rect.height / 2;
+      const ratio = nextZoom / prev.zoom;
+      animateCameraTo(
+        cx - (cx - prev.x) * ratio,
+        cy - (cy - prev.y) * ratio,
+        nextZoom,
+        false,
+        16
+      );
+    },
+    [animateCameraTo]
   );
 
   const searchMatches = useMemo(() => {
@@ -447,18 +583,16 @@ export function TreeCanvas({
     return results.slice(0, 6);
   }, [searchQuery, tree.archivePhotos, tree.persons]);
 
-  const screenToCanvas = useCallback(
-    (clientX: number, clientY: number) => {
-      const el = containerRef.current;
-      if (!el) return { x: 0, y: 0 };
-      const rect = el.getBoundingClientRect();
-      return {
-        x: (clientX - rect.left - pan.x) / zoom,
-        y: (clientY - rect.top - pan.y) / zoom,
-      };
-    },
-    [pan.x, pan.y, zoom]
-  );
+  const screenToCanvas = useCallback((clientX: number, clientY: number) => {
+    const el = containerRef.current;
+    if (!el) return { x: 0, y: 0 };
+    const rect = el.getBoundingClientRect();
+    const cam = currentCamRef.current;
+    return {
+      x: (clientX - rect.left - cam.x) / cam.zoom,
+      y: (clientY - rect.top - cam.y) / cam.zoom,
+    };
+  }, []);
 
   const findPersonAtCanvasPoint = useCallback(
     (cx: number, cy: number, excludeId?: string | null): string | null => {
@@ -1042,12 +1176,13 @@ export function TreeCanvas({
       const midScreenX = (pts[0].x + pts[1].x) / 2;
       const midScreenY = (pts[0].y + pts[1].y) / 2;
       const rect = containerRef.current?.getBoundingClientRect();
+      const cam = currentCamRef.current;
       if (rect && dist > 5) {
         pinchStateRef.current = {
           initialDist: dist,
-          initialZoom: zoom,
-          midCanvasX: (midScreenX - rect.left - pan.x) / zoom,
-          midCanvasY: (midScreenY - rect.top - pan.y) / zoom,
+          initialZoom: cam.zoom,
+          midCanvasX: (midScreenX - rect.left - cam.x) / cam.zoom,
+          midCanvasY: (midScreenY - rect.top - cam.y) / cam.zoom,
         };
       }
       setIsPanning(false);
@@ -1083,14 +1218,29 @@ export function TreeCanvas({
       return;
     }
 
+    const camNow = currentCamRef.current;
+    stopCameraAnimation();
+    targetCamRef.current = { ...camNow };
     setIsPanning(true);
     panStartRef.current = {
       mx: e.clientX,
       my: e.clientY,
-      px: pan.x,
-      py: pan.y,
+      px: camNow.x,
+      py: camNow.y,
       moved: false,
     };
+    panVelocityRef.current = {
+      vx: 0,
+      vy: 0,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      lastTime: performance.now(),
+    };
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore synthetic events
+    }
   };
 
   const handleCanvasPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -1104,16 +1254,17 @@ export function TreeCanvas({
       const rect = containerRef.current?.getBoundingClientRect();
       if (rect && dist > 5) {
         const nextZoom = Math.max(
-          0.28,
-          Math.min(2.2, pinchStateRef.current.initialZoom * (dist / pinchStateRef.current.initialDist))
+          MIN_ZOOM,
+          Math.min(MAX_ZOOM, pinchStateRef.current.initialZoom * (dist / pinchStateRef.current.initialDist))
         );
         const midScreenX = (pts[0].x + pts[1].x) / 2;
         const midScreenY = (pts[0].y + pts[1].y) / 2;
-        setZoom(nextZoom);
-        setPan({
-          x: midScreenX - rect.left - pinchStateRef.current.midCanvasX * nextZoom,
-          y: midScreenY - rect.top - pinchStateRef.current.midCanvasY * nextZoom,
-        });
+        animateCameraTo(
+          midScreenX - rect.left - pinchStateRef.current.midCanvasX * nextZoom,
+          midScreenY - rect.top - pinchStateRef.current.midCanvasY * nextZoom,
+          nextZoom,
+          true
+        );
       }
       return;
     }
@@ -1156,8 +1307,9 @@ export function TreeCanvas({
     }
 
     if (draggingNode) {
-      const dx = (e.clientX - draggingNode.startClientX) / zoom;
-      const dy = (e.clientY - draggingNode.startClientY) / zoom;
+      const currentZoom = currentCamRef.current.zoom;
+      const dx = (e.clientX - draggingNode.startClientX) / currentZoom;
+      const dy = (e.clientY - draggingNode.startClientY) / currentZoom;
       if (draggingNode.moved || Math.abs(dx) > 4 || Math.abs(dy) > 4) {
         lastDragMovedRef.current = true;
         const rawX = draggingNode.startNodeX + dx;
@@ -1205,10 +1357,26 @@ export function TreeCanvas({
       if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
         panStartRef.current.moved = true;
       }
-      setPan({
-        x: panStartRef.current.px + dx,
-        y: panStartRef.current.py + dy,
-      });
+      const now = performance.now();
+      const dt = now - panVelocityRef.current.lastTime;
+      if (dt >= 4) {
+        const instVx = (e.clientX - panVelocityRef.current.lastX) / dt;
+        const instVy = (e.clientY - panVelocityRef.current.lastY) / dt;
+        panVelocityRef.current = {
+          vx: panVelocityRef.current.vx * 0.6 + instVx * 0.4,
+          vy: panVelocityRef.current.vy * 0.6 + instVy * 0.4,
+          lastX: e.clientX,
+          lastY: e.clientY,
+          lastTime: now,
+        };
+      }
+      animateCameraTo(
+        panStartRef.current.px + dx,
+        panStartRef.current.py + dy,
+        targetCamRef.current.zoom,
+        false,
+        38
+      );
     }
   };
 
@@ -1216,6 +1384,13 @@ export function TreeCanvas({
     activePointersRef.current.delete(e.pointerId);
     if (activePointersRef.current.size < 2) {
       pinchStateRef.current = null;
+    }
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // ignore synthetic events
     }
 
     if (selectionBox) {
@@ -1241,6 +1416,21 @@ export function TreeCanvas({
       if (validMultiSelectedIds.length > 0 && !boxSelectMode) {
         setMultiSelectedIds([]);
       }
+    } else if (isPanning && panStartRef.current.moved && !draggingNode && !dragConnectSourceId) {
+      const elapsed = performance.now() - panVelocityRef.current.lastTime;
+      const { vx, vy } = panVelocityRef.current;
+      const speed = Math.hypot(vx, vy);
+      if (elapsed < 65 && speed > 0.14) {
+        const glideX = Math.max(-240, Math.min(240, vx * 115));
+        const glideY = Math.max(-240, Math.min(240, vy * 115));
+        animateCameraTo(
+          targetCamRef.current.x + glideX,
+          targetCamRef.current.y + glideY,
+          targetCamRef.current.zoom,
+          false,
+          10.5
+        );
+      }
     }
 
     setIsPanning(false);
@@ -1248,22 +1438,94 @@ export function TreeCanvas({
     setSnapGuides({ horizontalY: null, verticalX: null, distanceGuides: [] });
   };
 
-  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    e.preventDefault();
+  useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-    const factor = e.deltaY < 0 ? 1.09 : 0.91;
-    const nextZoom = Math.max(0.28, Math.min(2.2, zoom * factor));
-    const ratio = nextZoom / zoom;
-    setPan({
-      x: mx - (mx - pan.x) * ratio,
-      y: my - (my - pan.y) * ratio,
-    });
-    setZoom(nextZoom);
-  };
+
+    const onWheel = (e: WheelEvent) => {
+      const targetEl = e.target as HTMLElement | null;
+      if (targetEl?.closest('[data-canvas-ui="true"]')) {
+        return;
+      }
+      e.preventDefault();
+
+      let rawDelta = e.deltaY;
+      if (e.deltaMode === 1) rawDelta *= 32;
+      else if (e.deltaMode === 2) rawDelta *= 360;
+      else if (e.ctrlKey) rawDelta *= 3.5;
+
+      const clamped = Math.max(-180, Math.min(180, rawDelta));
+      if (Math.abs(clamped) < 0.01) return;
+
+      const factor = Math.exp(-clamped * 0.0018);
+      const rect = el.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+
+      const prev = targetCamRef.current;
+      const nextZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, prev.zoom * factor));
+      const ratio = nextZoom / prev.zoom;
+      animateCameraTo(
+        mx - (mx - prev.x) * ratio,
+        my - (my - prev.y) * ratio,
+        nextZoom,
+        false,
+        18
+      );
+    };
+
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+    };
+  }, [animateCameraTo]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (pendingDeleteIds) {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setPendingDeleteIds(null);
+        }
+        return;
+      }
+      if (e.key !== 'Delete' || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      if (editingPersonOpen || pendingConnection || photoLightbox) return;
+
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      const targets =
+        validMultiSelectedIds.length > 0
+          ? validMultiSelectedIds
+          : selectedPersonId && tree.persons[selectedPersonId]
+          ? [selectedPersonId]
+          : [];
+
+      if (targets.length === 0) return;
+      e.preventDefault();
+      setPendingDeleteIds(targets);
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    editingPersonOpen,
+    pendingConnection,
+    pendingDeleteIds,
+    photoLightbox,
+    selectedPersonId,
+    tree.persons,
+    validMultiSelectedIds,
+  ]);
 
   const handleNodeClick = (e: React.MouseEvent, personId: string) => {
     e.stopPropagation();
@@ -1736,7 +1998,7 @@ export function TreeCanvas({
               type="button"
               onClick={() => {
                 onResetPositions(viewMode);
-                setTimeout(fitTreeToViewport, 30);
+                setTimeout(() => fitTreeToViewport(false), 30);
               }}
               title="Выровнять древо автоматически"
               aria-label="Выровнять древо"
@@ -1763,22 +2025,44 @@ export function TreeCanvas({
             </button>
           )}
 
+          {onRedo && (
+            <button
+              type="button"
+              disabled={!canRedo}
+              onClick={onRedo}
+              title="Повторить отменённое действие (Ctrl+Y / Ctrl+Shift+Z)"
+              aria-label="Повторить отменённое действие"
+              className={`inline-flex h-9 w-9 items-center justify-center rounded-md border transition-colors shrink-0 ${
+                canRedo
+                  ? 'border-stone-200 bg-white text-stone-700 hover:border-stone-300 cursor-pointer'
+                  : 'border-stone-200/70 bg-white/60 text-stone-400 cursor-not-allowed'
+              }`}
+            >
+              <Redo2 size={15} />
+            </button>
+          )}
+
           <div className="inline-flex h-9 items-center rounded-md border border-stone-200 bg-white overflow-hidden">
             <button
               type="button"
-              onClick={() => setZoom((z) => Math.max(0.28, z * 0.86))}
+              onClick={() => handleToolbarZoom(0.84)}
               title="Отдалить"
               aria-label="Отдалить"
               className="flex h-full items-center px-2 text-stone-600 hover:bg-stone-50 cursor-pointer"
             >
               <ZoomOut size={14} />
             </button>
-            <span className="desktop-btn-label px-1.5 font-mono-tabular text-[13px] text-stone-600 min-w-[44px] text-center">
-              {Math.round(zoom * 100)}%
+            <span className="desktop-btn-label">
+              <span
+                ref={zoomPctRef}
+                className="inline-block w-[52px] shrink-0 font-ui-mono tabular-nums text-[12px] text-stone-600 text-center whitespace-nowrap"
+              >
+                {Math.round(zoom * 100)}%
+              </span>
             </span>
             <button
               type="button"
-              onClick={() => setZoom((z) => Math.min(2.2, z * 1.15))}
+              onClick={() => handleToolbarZoom(1.19)}
               title="Приблизить"
               aria-label="Приблизить"
               className="flex h-full items-center px-2 text-stone-600 hover:bg-stone-50 cursor-pointer"
@@ -1787,7 +2071,7 @@ export function TreeCanvas({
             </button>
             <button
               type="button"
-              onClick={fitTreeToViewport}
+              onClick={() => fitTreeToViewport(false)}
               title="Центрировать и поместить всё древо"
               aria-label="Центрировать древо"
               className="flex h-full items-center border-l border-stone-200 px-2.5 text-stone-700 hover:bg-stone-50 cursor-pointer"
@@ -1827,162 +2111,20 @@ export function TreeCanvas({
         </div>
       </div>
 
-      {/* Sub-header Bar: Lineage Legend + Logic Check + Local Status */}
-      <div className="relative flex flex-wrap items-center justify-between gap-2 border-b border-stone-200/80 bg-white/85 px-3 py-1.5 sm:px-5 text-[12.5px] sm:text-[13px] text-stone-600">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          {layout.legend.length > 0 && (
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-              {layout.legend.map((item) => (
-                <span key={item.stem} className="inline-flex items-center gap-1.5">
-                  <span
-                    className="h-2.5 w-2.5 rounded-full shrink-0"
-                    style={{ backgroundColor: item.color }}
-                  />
-                  <span>{item.name}</span>
-                </span>
-              ))}
-            </div>
-          )}
+      {/* Sub-header Bar: Lineage Legend */}
+      {layout.legend.length > 0 && (
+        <div className="relative flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-stone-200/80 bg-white/85 px-3 py-1.5 sm:px-5 text-[12.5px] sm:text-[13px] text-stone-600">
+          {layout.legend.map((item) => (
+            <span key={item.stem} className="inline-flex items-center gap-1.5">
+              <span
+                className="h-2.5 w-2.5 rounded-full shrink-0"
+                style={{ backgroundColor: item.color }}
+              />
+              <span>{item.name}</span>
+            </span>
+          ))}
         </div>
-
-        <div className="flex items-center gap-3 ml-auto">
-          {(() => {
-            const errorIssues = validationIssues.filter((i) => i.severity === 'error');
-            const warningIssues = validationIssues.filter((i) => i.severity !== 'error');
-            return (
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => setValidationOpen((v) => !v)}
-                  className={`inline-flex items-center gap-1.5 rounded px-2 py-0.5 font-medium transition-colors cursor-pointer ${
-                    errorIssues.length > 0
-                      ? 'bg-red-50 text-[#8B261D] border border-red-200 hover:bg-red-100/80'
-                      : warningIssues.length > 0
-                      ? 'bg-amber-50 text-amber-900 border border-amber-200 hover:bg-amber-100'
-                      : 'text-stone-600 hover:bg-stone-100'
-                  }`}
-                  title="Автоматическая проверка логических ошибок, отчеств, дат и родственных связей"
-                >
-                  {errorIssues.length > 0 ? (
-                    <AlertTriangle size={13} className="text-[#8B261D] shrink-0" />
-                  ) : warningIssues.length > 0 ? (
-                    <AlertTriangle size={13} className="text-amber-700 shrink-0" />
-                  ) : (
-                    <CheckCircle2 size={13} className="text-[#15803D] shrink-0" />
-                  )}
-                  <span>
-                    {errorIssues.length > 0
-                      ? warningIssues.length > 0
-                        ? `Ошибки: ${errorIssues.length} · Замечания: ${warningIssues.length}`
-                        : `Ошибки: ${errorIssues.length}`
-                      : warningIssues.length > 0
-                      ? `Проверка: ${warningIssues.length} замечаний`
-                      : 'Ошибок нет'}
-                  </span>
-                </button>
-
-                {validationOpen && (
-                  <div className="absolute right-0 top-full z-30 mt-1.5 w-[min(92vw,420px)] rounded-xl border border-stone-200 bg-white p-3.5 shadow-xl space-y-3">
-                    <div className="flex items-center justify-between border-b border-stone-100 pb-2">
-                      <span className="text-[14px] font-semibold text-stone-800">
-                        Логическая проверка древа
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setValidationOpen(false)}
-                        className="text-stone-400 hover:text-stone-700 cursor-pointer"
-                      >
-                        <X size={15} />
-                      </button>
-                    </div>
-
-                    {validationIssues.length === 0 ? (
-                      <p className="py-2 text-[13.5px] text-stone-600">
-                        Даты рождения, кончины, отчества, браки и родственные поколения согласованы — противоречий не обнаружено.
-                      </p>
-                    ) : (
-                      <div className="max-h-80 overflow-y-auto space-y-3 pr-1">
-                        {errorIssues.length > 0 && (
-                          <div className="space-y-1.5">
-                            <div className="text-[11.5px] font-semibold uppercase tracking-[0.06em] text-[#8B261D]">
-                              Ошибки ({errorIssues.length})
-                            </div>
-                            <div className="space-y-1.5">
-                              {errorIssues.map((issue) => (
-                                <button
-                                  key={issue.id}
-                                  type="button"
-                                  onClick={() => {
-                                    setValidationOpen(false);
-                                    focusOnPerson(issue.personId);
-                                    onEditPerson(issue.personId);
-                                  }}
-                                  className="w-full rounded-lg border border-red-200/80 bg-[#FBF9F5] p-2.5 text-left hover:border-[#8B261D]/55 transition-colors cursor-pointer"
-                                >
-                                  <div className="flex items-center gap-1.5 text-[13.5px] font-semibold text-stone-900">
-                                    <AlertTriangle
-                                      size={13}
-                                      className="text-[#8B261D] shrink-0"
-                                    />
-                                    <span>{issue.title}</span>
-                                  </div>
-                                  <p className="mt-1 text-[12.5px] leading-snug text-stone-600">
-                                    {issue.description}
-                                  </p>
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-
-                        {warningIssues.length > 0 && (
-                          <div className="space-y-1.5">
-                            <div className="text-[11.5px] font-semibold uppercase tracking-[0.06em] text-amber-800">
-                              Предупреждения ({warningIssues.length})
-                            </div>
-                            <div className="space-y-1.5">
-                              {warningIssues.map((issue) => (
-                                <button
-                                  key={issue.id}
-                                  type="button"
-                                  onClick={() => {
-                                    setValidationOpen(false);
-                                    focusOnPerson(issue.personId);
-                                    onEditPerson(issue.personId);
-                                  }}
-                                  className="w-full rounded-lg border border-stone-200 bg-[#FBF9F5] p-2.5 text-left hover:border-amber-400 transition-colors cursor-pointer"
-                                >
-                                  <div className="flex items-center gap-1.5 text-[13.5px] font-semibold text-stone-900">
-                                    <AlertTriangle
-                                      size={13}
-                                      className="text-amber-600 shrink-0"
-                                    />
-                                    <span>{issue.title}</span>
-                                  </div>
-                                  <p className="mt-1 text-[12.5px] leading-snug text-stone-600">
-                                    {issue.description}
-                                  </p>
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })()}
-
-          <div className="flex items-center gap-1.5 text-stone-600 whitespace-nowrap">
-            <Lock size={13} className="text-[#15803D]" />
-            <span>Локально</span>
-            <span aria-hidden="true">·</span>
-            <span className="font-mono-tabular">{personList.length} чел.</span>
-          </div>
-        </div>
-      </div>
+      )}
 
       {linkModeActive && (
         <div className="flex items-center justify-between gap-4 border-b border-[#8B261D]/20 bg-[#8B261D]/5 px-4 py-2 text-[14px] sm:text-[14.5px] text-stone-800">
@@ -2081,9 +2223,11 @@ export function TreeCanvas({
         onPointerMove={handleCanvasPointerMove}
         onPointerUp={handleCanvasPointerUp}
         onPointerCancel={handleCanvasPointerUp}
-        onWheel={handleWheel}
         onClick={() => setSearchOpen(false)}
-        style={{ touchAction: 'none' }}
+        style={{
+          touchAction: 'none',
+          backgroundPosition: `${currentCamRef.current.x}px ${currentCamRef.current.y}px`,
+        }}
         className={`archival-canvas-grid relative flex-1 overflow-hidden select-none ${
           isPanning
             ? 'cursor-grabbing'
@@ -2122,9 +2266,10 @@ export function TreeCanvas({
           </div>
         ) : (
           <div
-            className="origin-top-left"
+            ref={canvasLayerRef}
+            className="origin-top-left canvas-crisp-zoom"
             style={{
-              transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+              transform: `translate(${currentCamRef.current.x}px, ${currentCamRef.current.y}px) scale(${currentCamRef.current.zoom})`,
             }}
           >
             {/* SVG Rounded-Corner Orthogonal Lines Layer (behind cards) */}
@@ -3055,208 +3200,290 @@ export function TreeCanvas({
             )}
           </div>
         )}
+      </div>
 
-        {/* Visual Connection Confirmation Modal */}
-        {pendingConnection && (
+      {/* Delete Confirmation Modal (triggered by Delete key) */}
+      {pendingDeleteIds && pendingDeleteIds.length > 0 && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/45 p-4"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => setPendingDeleteIds(null)}
+        >
           <div
-            className="fixed inset-0 z-40 flex items-center justify-center bg-stone-950/35 p-4"
-            onClick={() => setPendingConnection(null)}
+            className="w-full max-w-md rounded-xl border border-stone-200 bg-[#FBF9F5] p-5 shadow-2xl space-y-4"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
           >
-            <div
-              className="w-full max-w-lg rounded-xl border border-stone-200 bg-[#FBF9F5] p-5 shadow-xl space-y-4 overflow-hidden"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <h3 className="font-editorial text-xl font-semibold text-[#78716C]">
-                  Установить родственную связь
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2 text-[#8B261D]">
+                <AlertTriangle size={18} className="shrink-0" />
+                <h3 className="font-editorial text-xl font-semibold text-stone-900">
+                  {pendingDeleteIds.length === 1
+                    ? 'Удалить карточку из древа?'
+                    : `Удалить карточки (${pendingDeleteIds.length})?`}
                 </h3>
-                <button
-                  type="button"
-                  onClick={() => setPendingConnection(null)}
-                  className="text-stone-400 hover:text-stone-700 cursor-pointer"
-                >
-                  <X size={16} />
-                </button>
               </div>
-
-              <div className="flex flex-col items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-4 py-3 text-center text-[15px] text-stone-700">
-                <div className="font-semibold text-stone-900">
-                  {tree.persons[pendingConnection.sourceId]
-                    ? formatFullName(tree.persons[pendingConnection.sourceId])
-                    : ''}
-                </div>
-                <div className="flex items-center justify-center text-stone-400">
-                  <ArrowUpDown size={15} />
-                </div>
-                <div className="font-semibold text-stone-900">
-                  {tree.persons[pendingConnection.targetId]
-                    ? formatFullName(tree.persons[pendingConnection.targetId])
-                    : ''}
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <label className="block text-[13.5px] font-medium text-stone-600">
-                  Характер связи
-                </label>
-                <div className="grid grid-cols-1 gap-2">
-                  {(
-                    [
-                      {
-                        id: 'as_spouse',
-                        label: 'Супруги / Партнёры',
-                      },
-                      {
-                        id: 'as_child',
-                        label: `${tree.persons[pendingConnection.sourceId]?.firstName} — родитель, ${tree.persons[pendingConnection.targetId]?.firstName} — ребёнок`,
-                      },
-                      {
-                        id: 'as_parent',
-                        label: `${tree.persons[pendingConnection.targetId]?.firstName} — родитель, ${tree.persons[pendingConnection.sourceId]?.firstName} — ребёнок`,
-                      },
-                    ] as const
-                  ).map((opt) => (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      onClick={() => setPendingKind(opt.id)}
-                      className={`rounded-md border px-3 py-2 text-left text-[14.5px] font-medium transition-colors cursor-pointer ${
-                        pendingKind === opt.id
-                          ? 'border-[#8B261D] bg-[#8B261D]/5 text-[#8B261D]'
-                          : 'border-stone-200 bg-white text-stone-700 hover:border-stone-300'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="space-y-3 border-t border-stone-200/80 pt-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <VerificationSelector value={pendingVerif} onChange={setPendingVerif} />
-                </div>
-                <div className="flex items-center justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPendingConnection(null);
-                      setLinkSourceId(null);
-                    }}
-                    className="rounded-md px-3.5 py-1.5 text-[14.5px] text-stone-600 hover:bg-stone-200/60 cursor-pointer"
-                  >
-                    Отмена
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onCreateConnection(
-                        pendingConnection.sourceId,
-                        pendingConnection.targetId,
-                        pendingKind,
-                        pendingVerif
-                      );
-                      setPendingConnection(null);
-                      setLinkSourceId(null);
-                      setLinkModeActive(false);
-                    }}
-                    className="rounded-md bg-[#8B261D] px-4 py-1.5 text-[14.5px] font-medium text-white hover:bg-[#741E17] cursor-pointer"
-                  >
-                    Связать
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Photo Search Lightbox Modal */}
-        {photoLightbox && (
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/85 p-4 sm:p-6"
-            onClick={() => {
-              setPhotoLightbox(null);
-              setLightboxHoveredTagId(null);
-            }}
-          >
-            <div
-              className="relative max-h-[90vh] max-w-4xl overflow-y-auto rounded-xl bg-[#FBF9F5] p-4"
-              onClick={(e) => e.stopPropagation()}
-            >
               <button
                 type="button"
-                onClick={() => {
-                  setPhotoLightbox(null);
-                  setLightboxHoveredTagId(null);
-                }}
-                aria-label="Закрыть просмотр фотографии"
-                className="absolute right-2.5 top-2.5 z-10 rounded-full p-1.5 text-stone-400/75 hover:bg-stone-200/45 hover:text-stone-700 transition-colors cursor-pointer"
+                onClick={() => setPendingDeleteIds(null)}
+                className="text-stone-400 hover:text-stone-700 cursor-pointer"
               >
                 <X size={16} />
               </button>
-              <div className="flex justify-center">
-                <PhotoTagFrameLayer
-                  src={photoLightbox.photo.dataUrl}
-                  alt={photoLightbox.photo.caption || 'Семейное фото'}
-                  tags={photoLightbox.photo.tags || []}
-                  persons={tree.persons}
-                  imgClassName="max-h-[70vh] w-auto rounded object-contain mx-auto block"
-                  hoveredTagId={lightboxHoveredTagId}
-                  onHoverTagChange={setLightboxHoveredTagId}
-                  onTagClick={(pid) => {
-                    setPhotoLightbox(null);
-                    setLightboxHoveredTagId(null);
-                    focusOnPerson(pid);
-                  }}
-                />
-              </div>
-              {(photoLightbox.photo.caption || photoLightbox.photo.year) && (
-                <div className="mt-3 px-4 text-center space-y-0.5">
-                  {photoLightbox.photo.caption && (
-                    <div className="font-editorial text-xl italic font-normal text-stone-900">
-                      {photoLightbox.photo.caption}
-                    </div>
-                  )}
-                  {photoLightbox.photo.year && (
-                    <div className="font-editorial tabular-nums text-base text-stone-500">
-                      {photoLightbox.photo.year}
-                    </div>
-                  )}
-                </div>
-              )}
-              {(photoLightbox.photo.tags || []).length > 0 && (
-                <div className="mt-3 flex flex-wrap items-center justify-center gap-1.5 px-2">
-                  <span className="text-[12.5px] text-stone-500">На фото:</span>
-                  {(photoLightbox.photo.tags || []).map((tag) => {
-                    const tp = tree.persons[tag.personId];
-                    if (!tp) return null;
-                    return (
-                      <button
-                        key={tag.id}
-                        type="button"
-                        onMouseEnter={() => setLightboxHoveredTagId(tag.id)}
-                        onMouseLeave={() => setLightboxHoveredTagId(null)}
-                        onClick={() => {
-                          setPhotoLightbox(null);
-                          setLightboxHoveredTagId(null);
-                          focusOnPerson(tp.id);
-                        }}
-                        className={`rounded-full border px-2.5 py-0.5 text-[13px] transition-colors cursor-pointer ${
-                          lightboxHoveredTagId === tag.id
-                            ? 'border-[#8B261D] bg-[#8B261D]/5 text-[#8B261D]'
-                            : 'border-stone-200 bg-white text-stone-800 hover:border-[#8B261D] hover:text-[#8B261D]'
-                        }`}
-                      >
-                        {formatFullName(tp)}
-                      </button>
-                    );
-                  })}
+            </div>
+
+            <div className="rounded-lg border border-stone-200 bg-white px-3.5 py-2.5 text-[14px] text-stone-800 space-y-1">
+              {pendingDeleteIds.slice(0, 5).map((pid) => {
+                const p = tree.persons[pid];
+                if (!p) return null;
+                return (
+                  <div key={pid} className="font-medium truncate">
+                    {formatFullName(p)}
+                  </div>
+                );
+              })}
+              {pendingDeleteIds.length > 5 && (
+                <div className="text-[13px] text-stone-500">
+                  и ещё {pendingDeleteIds.length - 5}...
                 </div>
               )}
             </div>
+
+            <p className="text-[13.5px] leading-relaxed text-stone-600">
+              {pendingDeleteIds.length === 1
+                ? 'Персона, её родственные связи и отметки на фотографиях будут удалены. При необходимости действие можно отменить кнопкой «Отменить» (Ctrl+Z).'
+                : 'Выбранные персоны, их родственные связи и отметки на фотографиях будут удалены. При необходимости действие можно отменить кнопкой «Отменить» (Ctrl+Z).'}
+            </p>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setPendingDeleteIds(null)}
+                className="rounded-md px-3.5 py-1.5 text-[14.5px] text-stone-600 hover:bg-stone-200/60 cursor-pointer"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onDeletePersons?.(pendingDeleteIds);
+                  setMultiSelectedIds([]);
+                  setPendingDeleteIds(null);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-md bg-[#8B261D] px-4 py-1.5 text-[14.5px] font-medium text-white hover:bg-[#741E17] cursor-pointer"
+              >
+                <Trash2 size={14} />
+                <span>Удалить</span>
+              </button>
+            </div>
           </div>
-        )}
-      </div>
+        </div>
+      )}
+
+      {/* Visual Connection Confirmation Modal */}
+      {pendingConnection && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center bg-stone-950/35 p-4"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => setPendingConnection(null)}
+        >
+          <div
+            className="w-full max-w-lg rounded-xl border border-stone-200 bg-[#FBF9F5] p-5 shadow-xl space-y-4 overflow-hidden"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="font-editorial text-xl font-semibold text-[#78716C]">
+                Установить родственную связь
+              </h3>
+              <button
+                type="button"
+                onClick={() => setPendingConnection(null)}
+                className="text-stone-400 hover:text-stone-700 cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="flex flex-col items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-4 py-3 text-center text-[15px] text-stone-700">
+              <div className="font-semibold text-stone-900">
+                {tree.persons[pendingConnection.sourceId]
+                  ? formatFullName(tree.persons[pendingConnection.sourceId])
+                  : ''}
+              </div>
+              <div className="flex items-center justify-center text-stone-400">
+                <ArrowUpDown size={15} />
+              </div>
+              <div className="font-semibold text-stone-900">
+                {tree.persons[pendingConnection.targetId]
+                  ? formatFullName(tree.persons[pendingConnection.targetId])
+                  : ''}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block text-[13.5px] font-medium text-stone-600">
+                Характер связи
+              </label>
+              <div className="grid grid-cols-1 gap-2">
+                {(
+                  [
+                    {
+                      id: 'as_spouse',
+                      label: 'Супруги / Партнёры',
+                    },
+                    {
+                      id: 'as_child',
+                      label: `${tree.persons[pendingConnection.sourceId]?.firstName} — родитель, ${tree.persons[pendingConnection.targetId]?.firstName} — ребёнок`,
+                    },
+                    {
+                      id: 'as_parent',
+                      label: `${tree.persons[pendingConnection.targetId]?.firstName} — родитель, ${tree.persons[pendingConnection.sourceId]?.firstName} — ребёнок`,
+                    },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setPendingKind(opt.id)}
+                    className={`rounded-md border px-3 py-2 text-left text-[14.5px] font-medium transition-colors cursor-pointer ${
+                      pendingKind === opt.id
+                        ? 'border-[#8B261D] bg-[#8B261D]/5 text-[#8B261D]'
+                        : 'border-stone-200 bg-white text-stone-700 hover:border-stone-300'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-3 border-t border-stone-200/80 pt-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <VerificationSelector value={pendingVerif} onChange={setPendingVerif} />
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingConnection(null);
+                    setLinkSourceId(null);
+                  }}
+                  className="rounded-md px-3.5 py-1.5 text-[14.5px] text-stone-600 hover:bg-stone-200/60 cursor-pointer"
+                >
+                  Отмена
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onCreateConnection(
+                      pendingConnection.sourceId,
+                      pendingConnection.targetId,
+                      pendingKind,
+                      pendingVerif
+                    );
+                    setPendingConnection(null);
+                    setLinkSourceId(null);
+                    setLinkModeActive(false);
+                  }}
+                  className="rounded-md bg-[#8B261D] px-4 py-1.5 text-[14.5px] font-medium text-white hover:bg-[#741E17] cursor-pointer"
+                >
+                  Связать
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Photo Search Lightbox Modal */}
+      {photoLightbox && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/85 p-4 sm:p-6"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => {
+            setPhotoLightbox(null);
+            setLightboxHoveredTagId(null);
+          }}
+        >
+          <div
+            className="relative max-h-[90vh] max-w-4xl overflow-y-auto rounded-xl bg-[#FBF9F5] p-4"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                setPhotoLightbox(null);
+                setLightboxHoveredTagId(null);
+              }}
+              aria-label="Закрыть просмотр фотографии"
+              className="absolute right-2.5 top-2.5 z-10 rounded-full p-1.5 text-stone-400/75 hover:bg-stone-200/45 hover:text-stone-700 transition-colors cursor-pointer"
+            >
+              <X size={16} />
+            </button>
+            <div className="flex justify-center">
+              <PhotoTagFrameLayer
+                src={photoLightbox.photo.dataUrl}
+                alt={photoLightbox.photo.caption || 'Семейное фото'}
+                tags={photoLightbox.photo.tags || []}
+                persons={tree.persons}
+                imgClassName="max-h-[70vh] w-auto rounded object-contain mx-auto block"
+                hoveredTagId={lightboxHoveredTagId}
+                onHoverTagChange={setLightboxHoveredTagId}
+                onTagClick={(pid) => {
+                  setPhotoLightbox(null);
+                  setLightboxHoveredTagId(null);
+                  focusOnPerson(pid);
+                }}
+              />
+            </div>
+            {(photoLightbox.photo.caption || photoLightbox.photo.year) && (
+              <div className="mt-3 px-4 text-center space-y-0.5">
+                {photoLightbox.photo.caption && (
+                  <div className="font-editorial text-xl italic font-normal text-stone-900">
+                    {photoLightbox.photo.caption}
+                  </div>
+                )}
+                {photoLightbox.photo.year && (
+                  <div className="font-editorial tabular-nums text-base text-stone-500">
+                    {photoLightbox.photo.year}
+                  </div>
+                )}
+              </div>
+            )}
+            {(photoLightbox.photo.tags || []).length > 0 && (
+              <div className="mt-3 flex flex-wrap items-center justify-center gap-1.5 px-2">
+                <span className="text-[12.5px] text-stone-500">На фото:</span>
+                {(photoLightbox.photo.tags || []).map((tag) => {
+                  const tp = tree.persons[tag.personId];
+                  if (!tp) return null;
+                  return (
+                    <button
+                      key={tag.id}
+                      type="button"
+                      onMouseEnter={() => setLightboxHoveredTagId(tag.id)}
+                      onMouseLeave={() => setLightboxHoveredTagId(null)}
+                      onClick={() => {
+                        setPhotoLightbox(null);
+                        setLightboxHoveredTagId(null);
+                        focusOnPerson(tp.id);
+                      }}
+                      className={`rounded-full border px-2.5 py-0.5 text-[13px] transition-colors cursor-pointer ${
+                        lightboxHoveredTagId === tag.id
+                          ? 'border-[#8B261D] bg-[#8B261D]/5 text-[#8B261D]'
+                          : 'border-stone-200 bg-white text-stone-800 hover:border-[#8B261D] hover:text-[#8B261D]'
+                      }`}
+                    >
+                      {formatFullName(tp)}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

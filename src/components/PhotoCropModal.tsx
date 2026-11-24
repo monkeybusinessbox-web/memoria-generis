@@ -3,6 +3,59 @@ import { Crosshair, Minimize2, RotateCcw, X, ZoomIn, ZoomOut } from 'lucide-reac
 import { PhotoAttachment, PhotoCrop } from '../types/genealogy';
 import { estimateDataUrlBytes, formatBytes } from '../utils/dateUtils';
 import { recompressDataUrl } from '../utils/storage';
+import { TagFrameRect } from './PhotoTagFrameLayer';
+
+export function computeTagFrameFromCrop(
+  crop: PhotoCrop,
+  aspectRatio = 1
+): TagFrameRect {
+  const r = aspectRatio > 0 && Number.isFinite(aspectRatio) ? aspectRatio : 1;
+  const z = Math.max(1, crop.zoom || 1);
+  const tx = (crop.x || 0) / 100;
+  const ty = (crop.y || 0) / 100;
+
+  const bx1 = (-0.5 - tx) / z;
+  const bx2 = (0.5 - tx) / z;
+  const by1 = (-0.5 - ty) / z;
+  const by2 = (0.5 - ty) / z;
+
+  let nx1: number;
+  let nx2: number;
+  let ny1: number;
+  let ny2: number;
+
+  if (r >= 1) {
+    nx1 = 0.5 + bx1 / r;
+    nx2 = 0.5 + bx2 / r;
+    ny1 = 0.5 + by1;
+    ny2 = 0.5 + by2;
+  } else {
+    nx1 = 0.5 + bx1;
+    nx2 = 0.5 + bx2;
+    ny1 = 0.5 + by1 * r;
+    ny2 = 0.5 + by2 * r;
+  }
+
+  const x1 = Math.max(0, Math.min(1, nx1));
+  const x2 = Math.max(0, Math.min(1, nx2));
+  const y1 = Math.max(0, Math.min(1, ny1));
+  const y2 = Math.max(0, Math.min(1, ny2));
+
+  const round1 = (v: number) => Math.round(v * 10) / 10;
+  let w = round1(Math.max(4, (x2 - x1) * 100));
+  let h = round1(Math.max(4, (y2 - y1) * 100));
+  let x = round1(Math.max(0, Math.min(100 - w, x1 * 100)));
+  let y = round1(Math.max(0, Math.min(100 - h, y1 * 100)));
+
+  if (w >= 98 && h >= 98) {
+    x = 2;
+    y = 2;
+    w = 96;
+    h = 96;
+  }
+
+  return { x, y, w, h };
+}
 
 interface CroppedCircleAvatarProps {
   photo: PhotoAttachment | null;
@@ -52,7 +105,7 @@ export function CroppedCircleAvatar({
 
 interface PhotoCropModalProps {
   photo: PhotoAttachment;
-  onSave: (updated: PhotoAttachment) => void;
+  onSave: (updated: PhotoAttachment, tagFrame?: TagFrameRect) => void;
   onClose: () => void;
 }
 
@@ -61,6 +114,7 @@ export function PhotoCropModal({ photo, onSave, onClose }: PhotoCropModalProps) 
     photo.crop || { x: 0, y: 0, zoom: 1.1 }
   );
   const [dataUrl, setDataUrl] = useState(photo.dataUrl);
+  const [naturalRatio, setNaturalRatio] = useState(1);
   const [isCompressing, setIsCompressing] = useState(false);
   const dragRef = useRef<{
     active: boolean;
@@ -150,6 +204,12 @@ export function PhotoCropModal({ photo, onSave, onClose }: PhotoCropModalProps) 
               src={dataUrl}
               alt="Кадрирование портрета"
               draggable={false}
+              onLoad={(e) => {
+                const img = e.currentTarget;
+                if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                  setNaturalRatio(img.naturalWidth / img.naturalHeight);
+                }
+              }}
               className="h-full w-full object-cover pointer-events-none select-none"
               style={{
                 transform: `translate(${crop.x}%, ${crop.y}%) scale(${crop.zoom})`,
@@ -243,7 +303,10 @@ export function PhotoCropModal({ photo, onSave, onClose }: PhotoCropModalProps) 
           </button>
           <button
             type="button"
-            onClick={() => onSave({ ...photo, dataUrl, crop })}
+            onClick={() => {
+              const tagFrame = computeTagFrameFromCrop(crop, naturalRatio);
+              onSave({ ...photo, dataUrl, crop }, tagFrame);
+            }}
             className="rounded-md bg-[#8B261D] px-4 py-2 text-[14.5px] font-medium text-white hover:bg-[#741E17] cursor-pointer"
           >
             Применить портрет
