@@ -1,0 +1,136 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+@theme {
+  --font-serif: Georgia, "Times New Roman", serif;
+  --font-sans: Georgia, "Times New Roman", serif;
+  --font-mono: Georgia, "Times New Roman", serif;
+}
+
+@layer base {
+  :root {
+    --font-serif: Georgia, "Times New Roman", serif;
+    --font-sans: Georgia, "Times New Roman", serif;
+    --font-mono: Georgia, "Times New Roman", serif;
+  }
+
+  html,
+  body {
+    font-family: var(--font-serif);
+    letter-spacing: 0.02em;
+    background-color: #fbf9f5;
+    color: #1c1917;
+  }
+
+  input,
+  textarea,
+  select,
+  button {
+    font-family: var(--font-serif);
+    letter-spacing: 0.02em;
+  }
+}
+
+.font-editorial {
+  font-family: var(--font-serif);
+}
+
+.font-mono-tabular {
+  font-family: var(--font-serif);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.archival-canvas-grid {
+  background-color: #f7f4ec;
+  background-image: radial-gradient(rgba(120, 113, 108, 0.16) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Clean archival styling for Leaflet containers and popups */
+.leaflet-container {
+  font-family: var(--font-serif);
+  background: #edeae2;
+}
+.leaflet-popup-content-wrapper {
+  background-color: #fbf9f5;
+  border-radius: 16px;
+  border: 1px solid #e7e5e4;
+  box-shadow: 0 20px 35px rgba(28, 25, 23, 0.16);
+  max-width: calc(100vw - 28px);
+}
+.leaflet-popup-tip {
+  background-color: #fbf9f5;
+  border: 1px solid #e7e5e4;
+}
+.leaflet-popup-content {
+  font-family: var(--font-serif);
+  margin: 15px 18px 14px 15px;
+  width: auto !important;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Show text labels only on large fine-pointer desktops; keep icons-only on smartphones & tablets in any orientation */
+.desktop-btn-label {
+  display: none;
+}
+.desktop-flex-bar {
+  display: none;
+}
+.touch-icon-only {
+  display: inline-flex;
+}
+@media (min-width: 1280px) and (hover: hover) and (pointer: fine) {
+  .desktop-btn-label {
+    display: inline;
+  }
+  .desktop-flex-bar {
+    display: flex;
+  }
+  .touch-icon-only {
+    display: none;
+  }
+}
+.leaflet-container a.leaflet-popup-close-button {
+  top: 7px;
+  right: 7px;
+  color: #78716c;
+  padding: 2px;
+}
+.leaflet-container a.leaflet-popup-close-button:hover {
+  color: #1c1917;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 113, 108, 0.28);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 113, 108, 0.48);
+}
